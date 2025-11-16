@@ -1,0 +1,24 @@
+# Зависимости для WebSocket сервера с распознаванием спикеров
+# websocket_server_with_speakers.py
+
+# Основные библиотеки
+numpy>=1.24.0
+websockets>=12.0
+huggingface-hub>=0.20.0  # Для загрузки моделей
+
+# PyTorch (последние версии для Python 3.13)
+torch>=2.9.0
+torchaudio>=2.9.0
+
+# Whisper для транскрибации
+faster-whisper>=0.10.0
+
+# SpeechBrain для распознавания спикеров
+speechbrain>=1.0.0
+
+# TTS (голосовые персонажи)
+pyttsx3>=2.90
+pywin32>=306  # Для pyttsx3 на Windows
+
+# Аудио
+sounddevice>=0.4.6
