@@ -255,7 +255,7 @@ def update_speaker_embedding(speaker_id, new_embedding, alpha=0.3):
         save_speakers_database()
 
 
-async def handle_client(websocket, path):
+async def handle_client(websocket):
     client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
     print(f"🎙️  Подключился: {client_id}")
     
