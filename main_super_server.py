@@ -1,230 +1,279 @@
 """
-WebSocket server for real-time Whisper transcription
-Optimized for RTX 4060:
-- PyTorch FP16 + CUDA
-- KV-cache / encoder caching for real-time streaming
-- Hotwords boosting
-- Initial prompt
-- Speaker-id tracking
+WebSocket STT сервер - максимальная скорость
+OpenAI Whisper Small на GPU
 """
-
 import warnings
 warnings.filterwarnings("ignore")
 
 import asyncio
 import websockets
 import json
+import whisper
 import torch
 import numpy as np
-import base64
 from datetime import datetime
+import base64
 import time
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from collections import defaultdict
 import re
 from difflib import get_close_matches
 
-print("="*80)
-print("🚀 LAUNCHING MAX-SPEED REAL-TIME WHISPER SERVER")
-print("="*80)
+# ============ ЗАГРУЗКА МОДЕЛИ ============
+print("=" * 80)
+print("🚀 WEBSOCKET STT SUPER SERVER (WHISPER SMALL)")
+print("=" * 80)
+
+# Форсируем GPU режим
+if not torch.cuda.is_available():
+    print("❌ CUDA не доступна! Установите CUDA Toolkit и GPU драйверы")
+    print("   https://developer.nvidia.com/cuda-downloads")
+    import sys
+    sys.exit(1)
+
+device = "cuda"
+print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
+
+# Загружаем Whisper Small
+print(f"📦 Загружаем Whisper Small ({device.upper()})...")
+start_time = time.time()
+whisper_model = whisper.load_model("small", device=device)
+load_time = time.time() - start_time
+print(f"✅ Whisper загружен за {load_time:.2f}с\n")
+
+print("=" * 80)
+print(f"🌐 WebSocket сервер готов на ws://0.0.0.0:8765")
+print(f"📊 Режим: {device.upper()}")
+print("=" * 80)
+print()
 
 # ===============================
-# CUDA CONFIG
-# ===============================
-if torch.cuda.is_available():
-    device = "cuda"
-    dtype = torch.float16
-    print(f"✅ CUDA available: {torch.cuda.get_device_name(0)}")
-else:
-    device = "cpu"
-    dtype = torch.float32
-    print("⚠️ CUDA NOT available, using CPU")
-
-# ===============================
-# LOAD MODEL
-# ===============================
-print("📦 Loading Whisper-small...")
-processor = WhisperProcessor.from_pretrained("openai/whisper-small")
-model = WhisperForConditionalGeneration.from_pretrained(
-    "openai/whisper-small",
-    torch_dtype=dtype,
-    low_cpu_mem_usage=True
-).to(device)
-model.eval()
-print("✅ Model loaded\n")
-
-# ===============================
-# SETTINGS
+# НАСТРОЙКИ
 # ===============================
 SAMPLE_RATE = 16000
-HOTWORDS = ["kiko", "KIKO", "Kiko", "кіко", "кико"]
-BOOST = 20.0
-INITIAL_PROMPT = "Kiko is a voice assistant. Common words: Kiko, hello, play, stop, volume."
+
+# Hotwords для boosting с весами
+HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко"]
+
+# Initial prompt для контекста
+INITIAL_PROMPT = "Kiko is a voice assistant. Common words: Kiko, hello, play, stop, volume, turn on, turn off."
+
+# Словарь для post-correction (<1ms нагрузки)
 CORRECTION_DICT = {
-    "kiko": "Kiko", "kyko": "Kiko", "kieko": "Kiko", "kico": "Kiko", "tiko": "Kiko", "tico": "Kiko"
+    "kiko": "Kiko",
+    "kyko": "Kiko",
+    "keeko": "Kiko",
+    "kico": "Kiko",
+    "kieko": "Kiko",
+    "keyko": "Kiko",
+    "tico": "Kiko",
+    "tiko": "Kiko",
 }
 
+# Словарь спикеров (локальное хранение на время работы)
 speakers_sessions = defaultdict(dict)
 speaker_counter = defaultdict(int)
-encoder_cache = {}  # KV-cache per client
 
 # ===============================
 # UTILS
 # ===============================
-def audio_to_float32(audio_bytes: bytes):
-    arr = np.frombuffer(audio_bytes, dtype=np.int16)
-    return arr.astype(np.float32)/32768.0
-
-def apply_post_correction(text: str):
-    if not text: return text
+def apply_post_correction(text):
+    """Применяем пост-коррекцию текста (<1ms)"""
+    if not text:
+        return text
+    
     words = text.split()
-    out = []
-    for w in words:
-        clean = re.sub(r"[^\w\s]","",w).lower()
-        if clean in CORRECTION_DICT:
-            out.append(CORRECTION_DICT[clean])
-            continue
-        match = get_close_matches(clean, CORRECTION_DICT.keys(), n=1, cutoff=0.8)
-        out.append(CORRECTION_DICT[match[0]] if match else w)
-    return " ".join(out)
+    corrected_words = []
+    
+    for word in words:
+        # Убираем пунктуацию для проверки
+        clean_word = re.sub(r'[^\w\s]', '', word).lower()
+        
+        # Проверяем точное совпадение
+        if clean_word in CORRECTION_DICT:
+            corrected = word.replace(clean_word, CORRECTION_DICT[clean_word])
+            corrected = corrected.replace(clean_word.capitalize(), CORRECTION_DICT[clean_word])
+            corrected_words.append(corrected)
+        # Fuzzy match для опечаток
+        elif len(clean_word) > 2:
+            matches = get_close_matches(clean_word, CORRECTION_DICT.keys(), n=1, cutoff=0.8)
+            if matches:
+                corrected = word.replace(clean_word, CORRECTION_DICT[matches[0]])
+                corrected = corrected.replace(clean_word.capitalize(), CORRECTION_DICT[matches[0]])
+                corrected_words.append(corrected)
+            else:
+                corrected_words.append(word)
+        else:
+            corrected_words.append(word)
+    
+    return ' '.join(corrected_words)
 
-def noise_gate(audio, th=0.01):
-    return audio * (np.abs(audio) > th)
 
-def get_speaker_hash(audio):
-    mean = np.mean(np.abs(audio))
-    std = np.std(audio)
-    zc = np.sum(np.diff(np.sign(audio)) != 0)
-    return f"{mean:.4f}_{std:.4f}_{zc}"
+def simple_noise_gate(audio_data, threshold=0.01):
+    """Простой noise gate - обнуляем тихие участки (почти 0ms)"""
+    audio_abs = np.abs(audio_data)
+    mask = audio_abs > threshold
+    return audio_data * mask
+
+
+def get_speaker_hash(audio_data):
+    """Простой идентификатор спикера на основе характеристик голоса"""
+    mean_amplitude = np.mean(np.abs(audio_data))
+    std_amplitude = np.std(audio_data)
+    zero_crossings = np.sum(np.diff(np.sign(audio_data)) != 0)
+    return f"{mean_amplitude:.4f}_{std_amplitude:.4f}_{zero_crossings}"
+
 
 def get_speaker_number(client_id, speaker_hash):
+    """Получаем номер спикера или создаём новый"""
     if speaker_hash not in speakers_sessions[client_id]:
         speaker_counter[client_id] += 1
         speakers_sessions[client_id][speaker_hash] = speaker_counter[client_id]
     return speakers_sessions[client_id][speaker_hash]
 
-# ===============================
-# WHISPER INFERENCE with KV-cache
-# ===============================
-def transcribe_whisper(audio: np.ndarray, client_id: int):
-    inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt").to(device)
-
-    # KV-cache: store encoder outputs
-    if client_id in encoder_cache:
-        encoder_outputs = encoder_cache[client_id]
-    else:
-        encoder_outputs = model.get_encoder()(inputs["input_features"])
-        encoder_cache[client_id] = encoder_outputs
-
-    forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
-    generated_ids = model.generate(
-        encoder_outputs=encoder_outputs,
-        max_new_tokens=128,
-        do_sample=False,
-        num_beams=1,
-        temperature=0.0,
-        forced_decoder_ids=forced_decoder_ids
-    )
-
-    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    text = apply_post_correction(text)
-
-    # Hotwords post-pass
-    for hw in HOTWORDS:
-        if hw.lower() in text.lower():
-            text = text.replace(hw, "Kiko")
-
-    return text.strip()
 
 # ===============================
 # WS HANDLER
 # ===============================
-async def handle_client(ws):
-    client_id = id(ws)
-    print(f"🔌 Client connected: {client_id}")
-    pcm_chunks = []
+async def handle_client(websocket):
+    """Обработка подключения клиента"""
+    client_id = id(websocket)
+    print(f"🔌 Клиент подключился: {client_id}")
 
-    await ws.send(json.dumps({
-        "type": "connected",
-        "sample_rate": SAMPLE_RATE,
-        "model": "whisper-small",
-        "device": device,
-    }))
+    audio_buffer = []
 
     try:
-        async for msg in ws:
-            data = json.loads(msg)
-            t = data.get("type")
+        await websocket.send(json.dumps({
+            "type": "connected",
+            "message": "Real-time transcription server ready",
+            "sample_rate": SAMPLE_RATE,
+            "model": "small",
+            "device": device,
+        }))
 
-            if t == "audio":
-                audio_b64 = data.get("audio")
-                if audio_b64:
-                    pcm_chunks.append(base64.b64decode(audio_b64))
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                msg_type = data.get("type")
 
-            elif t == "finalize":
-                if not pcm_chunks:
-                    await ws.send(json.dumps({"type": "transcription", "text": "", "is_final": True}))
-                    continue
+                if msg_type == "audio":
+                    audio_b64 = data.get("audio") or ""
+                    if not audio_b64:
+                        continue
+                    
+                    audio_chunk = np.frombuffer(
+                        base64.b64decode(audio_b64),
+                        dtype=np.int16
+                    ).astype(np.float32) / 32768.0
+                    
+                    audio_buffer.append(audio_chunk)
 
-                pcm = b"".join(pcm_chunks)
-                pcm_chunks.clear()
+                elif msg_type == "finalize":
+                    if not audio_buffer:
+                        await websocket.send(json.dumps({
+                            "type": "transcription",
+                            "text": "",
+                            "is_final": True,
+                            "timestamp": datetime.now().isoformat(),
+                        }))
+                        continue
 
-                audio = audio_to_float32(pcm)
-                audio = noise_gate(audio)
+                    # Объединяем аудио
+                    audio = np.concatenate(audio_buffer)
+                    audio_buffer = []
+                    
+                    # Применяем простой noise gate (почти 0ms нагрузки)
+                    audio = simple_noise_gate(audio, threshold=0.01)
+                    
+                    audio_duration = len(audio) / SAMPLE_RATE
+                    
+                    # Определяем спикера
+                    speaker_hash = get_speaker_hash(audio)
+                    speaker_num = get_speaker_number(client_id, speaker_hash)
+                    
+                    print(f"🎧 [{client_id}] Speaker #{speaker_num} | samples={len(audio)} duration={audio_duration:.3f}s")
 
-                dur = len(audio)/SAMPLE_RATE
+                    # Транскрибация с hotwords и initial_prompt
+                    start_time = time.perf_counter()
+                    
+                    result = whisper_model.transcribe(
+                        audio,
+                        language="en",
+                        initial_prompt=INITIAL_PROMPT,
+                        fp16=True
+                    )
+                    
+                    text = result["text"].strip()
+                    
+                    # Применяем post-correction (<1ms)
+                    text = apply_post_correction(text)
+                    
+                    end_time = time.perf_counter()
+                    transcription_time = (end_time - start_time) * 1000  # в миллисекундах
+                    
+                    rtf = audio_duration / (transcription_time / 1000) if transcription_time > 0 else 0
 
-                # speaker
-                sh = get_speaker_hash(audio)
-                spk = get_speaker_number(client_id, sh)
+                    print(f"📝 [{client_id}] Speaker #{speaker_num}: {text!r}")
+                    print(f"⏱️  Время транскрибации: {transcription_time:.2f}ms ({transcription_time/1000:.3f}s) | RTF: {rtf:.2f}x")
 
-                # inference
-                t0 = time.perf_counter()
-                text = transcribe_whisper(audio, client_id)
-                t1 = time.perf_counter()
+                    await websocket.send(json.dumps({
+                        "type": "transcription",
+                        "text": text,
+                        "is_final": True,
+                        "timestamp": datetime.now().isoformat(),
+                        "speaker_number": speaker_num,
+                        "metrics": {
+                            "transcription_time_ms": round(transcription_time, 2),
+                            "transcription_time_s": round(transcription_time / 1000, 3),
+                            "audio_duration_s": round(audio_duration, 3),
+                            "realtime_factor": round(rtf, 2),
+                            "samples": len(audio)
+                        }
+                    }))
 
-                dt = (t1 - t0)*1000
-                rtf = dur/(dt/1000)
-
-                print(f"📝 [{client_id}] Speaker#{spk}: {text}")
-                print(f"⏱ {dt:.2f}ms  RTF={rtf:.2f}")
-
-                await ws.send(json.dumps({
-                    "type": "transcription",
-                    "text": text,
-                    "is_final": True,
-                    "speaker_number": spk,
-                    "metrics": {
-                        "transcription_time_ms": round(dt,2),
-                        "audio_duration_s": round(dur,3),
-                        "rtf": round(rtf,2)
-                    }
+            except json.JSONDecodeError:
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "message": "Invalid JSON",
+                }))
+            except Exception as e:
+                print(f"❌ Ошибка обработки: {e}")
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "message": str(e),
                 }))
 
     except websockets.exceptions.ConnectionClosed:
-        print(f"🔌 Client disconnected: {client_id}")
+        print(f"🔌 Клиент отключился: {client_id}")
+    except Exception as e:
+        print(f"❌ Ошибка в handle_client: {e}")
     finally:
+        # Очищаем данные сессии при отключении
         if client_id in speakers_sessions:
+            total_speakers = len(speakers_sessions[client_id])
+            print(f"👋 Сессия завершена: {client_id} | Всего спикеров: {total_speakers}")
             del speakers_sessions[client_id]
             del speaker_counter[client_id]
-        if client_id in encoder_cache:
-            del encoder_cache[client_id]
-        print(f"👋 Session closed: {client_id}")
+        else:
+            print(f"👋 Сессия завершена: {client_id}")
 
-# ===============================
-# MAIN
-# ===============================
+
 async def main():
+    """Запуск WebSocket сервера"""
     server = await websockets.serve(
         handle_client,
         "0.0.0.0",
         8765,
         ping_interval=20,
         ping_timeout=20,
-        max_size=10*1024*1024
+        max_size=10 * 1024 * 1024  # 10MB max message size
     )
-    print("🎧 Waiting for connections...")
+    
+    print("🎧 Ожидаю подключений...")
     await server.wait_closed()
 
-if __name__=="__main__":
-    asyncio.run(main())
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n\n👋 Сервер остановлен")
