@@ -116,10 +116,10 @@ print()
 SAMPLE_RATE = 16000
 
 # Hotwords для boosting с весами (чем выше вес, тем сильнее приоритет)
-HOTWORDS = "Kiko:10.0, kiko:10.0, кико:8.0, кіко:8.0"
+HOTWORDS = "Kiko:100.0, kiko:100.0, KIKO:100.0, кико:80.0, кіко:80.0, Кико:80.0"
 
-# Initial prompt для контекста (0% нагрузки)
-INITIAL_PROMPT = "Kiko is a voice assistant. Common words: Kiko, hello, play, stop, volume, turn on, turn off."
+# Initial prompt для контекста (0% нагрузки) - упоминаем Kiko много раз
+INITIAL_PROMPT = "Kiko Kiko Kiko. Voice assistant named Kiko. Keywords: Kiko, kiko, KIKO."
 
 # Словарь для post-correction (<1ms нагрузки)
 CORRECTION_DICT = {
@@ -299,13 +299,21 @@ async def handle_client(websocket):
                 
                 duration = len(audio) / SAMPLE_RATE
                 
-                # Транскрибация с hotwords и initial_prompt
+                # Транскрибация с initial_prompt (ЭКСТРЕМАЛЬНАЯ СКОРОСТЬ)
                 start_time = time.time()
                 result = whisper_model.transcribe(
                     audio,
-                    language="en",
-                    initial_prompt=INITIAL_PROMPT,  # Контекст для модели (+0-2ms)
-                    fp16=True
+                    language=None,  # Автоопределение языка (русский/английский)
+                    initial_prompt=INITIAL_PROMPT,  # Kiko упоминается 3 раза для приоритета (заменяет hotwords)
+                    fp16=True,
+                    beam_size=1,  # Greedy decoding (быстрее в 5х)
+                    best_of=1,  # Только один вариант (быстрее в 2х)
+                    temperature=0.0,  # Детерминированный выбор
+                    condition_on_previous_text=False,  # Не использовать предыдущий контекст
+                    no_speech_threshold=0.9,  # Агрессивно пропускаем тишину
+                    logprob_threshold=-0.5,  # Быстрее отсекаем плохие варианты
+                    compression_ratio_threshold=1.8,  # Быстрее обрезаем повторы
+                    word_timestamps=False  # Не считаем timestamps для скорости
                 )
                 text = result["text"].strip()
                 
@@ -330,16 +338,23 @@ async def handle_client(websocket):
                     }
                     update_speaker_embedding(speaker_id, embedding)
                 else:
+                    # Автоматически регистрируем нового спикера
+                    new_speaker_name = f"Собеседник #{len(speakers_database) + 1}"
+                    speaker_id = register_speaker(new_speaker_name, embedding)
+                    print(f"✅ Автоматически зарегистрирован: {new_speaker_name} (ID: {speaker_id})")
                     speaker_info = {
-                        "id": "unknown",
-                        "name": "Unknown Speaker",
-                        "similarity": round(similarity, 3),
-                        "is_known": False
+                        "id": speaker_id,
+                        "name": new_speaker_name,
+                        "similarity": 1.0,  # Первый раз - 100% совпадение
+                        "is_known": True,
+                        "is_new": True
                     }
                 
                 rtf = transcribe_time / duration if duration > 0 else 0
                 
-                print(f"🧠 [{client_id}] {speaker_info['name']}: {text!r}")
+                # Улучшенный вывод с similarity score
+                speaker_display = f"{speaker_info['name']} ({similarity:.2%})" if speaker_info['is_known'] else f"❓ Unknown (похожесть: {similarity:.2%})"
+                print(f"🧠 [{client_id}] {speaker_display}: {text!r}")
                 print(f"⏱️  {duration:.2f}s аудио → {transcribe_time*1000:.0f}ms STT + {speaker_time*1000:.0f}ms speaker (RTF: {rtf:.3f}x)")
                 
                 response = {
@@ -417,7 +432,7 @@ async def handle_client(websocket):
 
 async def main():
     host = "0.0.0.0"
-    port = 8766
+    port = 8765
     
     print(f"🎧 Ожидаю подключений...")
     

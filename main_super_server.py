@@ -116,11 +116,25 @@ def simple_noise_gate(audio_data, threshold=0.01):
 
 
 def get_speaker_hash(audio_data):
-    """Простой идентификатор спикера на основе характеристик голоса"""
+    """Улучшенный идентификатор спикера на основе характеристик голоса"""
+    # Базовые характеристики
     mean_amplitude = np.mean(np.abs(audio_data))
     std_amplitude = np.std(audio_data)
     zero_crossings = np.sum(np.diff(np.sign(audio_data)) != 0)
-    return f"{mean_amplitude:.4f}_{std_amplitude:.4f}_{zero_crossings}"
+    
+    # Дополнительные характеристики для лучшего различия
+    # Спектральный центроид (приблизительно)
+    fft = np.fft.rfft(audio_data)
+    magnitude = np.abs(fft)
+    spectral_centroid = np.sum(magnitude * np.arange(len(magnitude))) / np.sum(magnitude) if np.sum(magnitude) > 0 else 0
+    
+    # Энергия в разных частотных диапазонах
+    low_freq_energy = np.sum(magnitude[:len(magnitude)//4])
+    high_freq_energy = np.sum(magnitude[3*len(magnitude)//4:])
+    
+    # Создаём более детальный "отпечаток"
+    speaker_hash = f"{mean_amplitude:.5f}_{std_amplitude:.5f}_{zero_crossings}_{spectral_centroid:.2f}_{low_freq_energy:.2f}_{high_freq_energy:.2f}"
+    return speaker_hash
 
 
 def get_speaker_number(client_id, speaker_hash):
