@@ -44,10 +44,10 @@ if not torch.cuda.is_available():
 device = "cuda"
 print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
 
-# Загружаем Whisper Small
-print(f"📦 Загружаем Whisper Small ({device.upper()})...")
+# Загружаем Whisper Medium - более точная модель
+print(f"📦 Загружаем Whisper Medium ({device.upper()})...")
 start_time = time.time()
-whisper_model = whisper.load_model("small", device=device)
+whisper_model = whisper.load_model("medium", device=device)
 load_time = time.time() - start_time
 print(f"✅ Whisper загружен за {load_time:.2f}с\n")
 
@@ -107,23 +107,31 @@ HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко", "Кико"]
 # НЕ используем "assistant", "voice assistant" и т.д. - Whisper повторяет их!
 INITIAL_PROMPT = None  # Отключён для предотвращения галлюцинаций
 
-# Расширенный словарь для post-correction - МНОГО вариантов для надёжного распознавания
+# Расширенный словарь для post-correction - уровень Алисы
 CORRECTION_DICT = {
-    # Английские варианты (все возможные произношения)
+    # Основные английские варианты
     "kiko": "Kiko", "kyko": "Kiko", "keeko": "Kiko", "kico": "Kiko",
     "kieko": "Kiko", "keyko": "Kiko", "tico": "Kiko", "tiko": "Kiko",
     "keco": "Kiko", "cico": "Kiko", "qico": "Kiko", "kika": "Kiko",
     "kikko": "Kiko", "keko": "Kiko", "chico": "Kiko", "kiku": "Kiko",
     "keeco": "Kiko", "kigo": "Kiko", "kijo": "Kiko", "kito": "Kiko",
     "kikou": "Kiko", "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko",
-    "quico": "Kiko", "keko": "Kiko", "keekou": "Kiko", "kikov": "Kiko",
-    "kikoу": "Kiko", "keiko": "Kiko", "kico": "Kiko", "kykou": "Kiko",
-    # Whisper часто слышит как "key call" или "he called"
-    "keycall": "Kiko", "key-call": "Kiko",
+    "quico": "Kiko", "keekou": "Kiko", "kikov": "Kiko", "keiko": "Kiko",
+    # Whisper ошибки - слышит как другие слова
+    "keycall": "Kiko", "key-call": "Kiko", "kicker": "Kiko",
+    "ticker": "Kiko", "picker": "Kiko", "clicker": "Kiko",
+    "gecko": "Kiko", "geko": "Kiko", "geeko": "Kiko",
+    "eagle": "Kiko", "legal": "Kiko", "sequel": "Kiko",
+    "he go": "Kiko", "key go": "Kiko", "key cool": "Kiko",
+    "ki ko": "Kiko", "ki go": "Kiko", "kee ko": "Kiko",
+    # Начало фразы с hey/ok
+    "hey kiko": "Kiko", "hey kyko": "Kiko", "ok kiko": "Kiko", "okay kiko": "Kiko",
+    "hi kiko": "Kiko", "hi kyko": "Kiko",
     # Русские варианты
     "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko", "тико": "Kiko",
     "кику": "Kiko", "кіку": "Kiko", "кико.": "Kiko", "кико,": "Kiko",
-    "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko",
+    "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko", "кэко": "Kiko", "кэку": "Kiko",
+    "кіка": "Kiko",
 }
 
 # Паттерны для определения типа фразы
@@ -296,19 +304,36 @@ def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
         return VADConfig.MAX_PAUSE_MS
 
 
-# Фонетические варианты Kiko для fuzzy matching
+# Фонетические варианты Kiko для fuzzy matching (расширенный список уровня Алисы)
 KIKO_PHONETIC_VARIANTS = [
+    # Основные варианты
     "kiko", "kyko", "keeko", "kico", "kieko", "keyko", "tico", "tiko",
     "keco", "cico", "qico", "kika", "kikko", "keko", "chico", "kiku",
     "keeco", "kigo", "kijo", "kito", "kikou", "kicco", "kyco", "keiko",
     "quico", "keekou", "kikov", "key co", "key go", "ki ko", "ki go",
     "kee ko", "kee go", "key cool", "kekko", "geko", "gecko",
+    # Дополнительные фонетические совпадения
+    "kika", "kikou", "keeku", "kiku", "keeku", "kieko", "kyeku",
+    "kico", "gico", "hiko", "iko", "ikko", "kiku", "kicu",
+    "keiku", "keico", "keigo", "keijo", "keikou", "kikoh", "kikow",
+    # Whisper часто распознает как эти слова
+    "he go", "key goal", "kegal", "legal", "eagle", "sequel",
+    "kicker", "ticker", "picker", "quicker", "clicker",
+    # Начало фразы может быть распознано как
+    "hey kiko", "hey kyko", "ok kiko", "okay kiko",
+    # Русские варианты
+    "кико", "кіко", "кика", "кеко", "тико", "кику", "кіку",
+    "киго", "кійко", "кийко", "кэко", "кэку", "кіка",
 ]
 
 
 def fuzzy_match_kiko(word: str) -> bool:
-    """Проверяет, похоже ли слово на 'Kiko' (fuzzy matching)"""
+    """Проверяет, похоже ли слово на 'Kiko' (fuzzy matching уровня Алисы)"""
     clean = re.sub(r'[^\w]', '', word).lower()
+    
+    # Пустое слово
+    if not clean:
+        return False
     
     # Прямое совпадение
     if clean in CORRECTION_DICT:
@@ -318,13 +343,28 @@ def fuzzy_match_kiko(word: str) -> bool:
     if clean in KIKO_PHONETIC_VARIANTS:
         return True
     
-    # Расстояние Левенштейна (простая версия)
-    if len(clean) >= 3 and len(clean) <= 6:
-        for variant in ["kiko", "keko", "kico", "kiku"]:
+    # Проверка на начало с ki/ke/ky + окончание o/u/a
+    if len(clean) >= 3 and len(clean) <= 7:
+        # Паттерн: начинается с k/c/q + гласная, заканчивается на o/u/a/oh
+        if re.match(r'^[kcqg][ieyae][kcgqt]?[oua]h?$', clean):
+            return True
+        # Паттерн: kik/kek/kyk + любое окончание
+        if re.match(r'^[kcq][iey][kcq]', clean):
+            return True
+    
+    # Расстояние Левенштейна - расширенный список референсов
+    if len(clean) >= 3 and len(clean) <= 7:
+        for variant in ["kiko", "keko", "kico", "kiku", "keiko", "kyko", "kikko"]:
+            if len(clean) > len(variant) + 2:
+                continue
             diff = sum(1 for a, b in zip(clean, variant) if a != b)
             diff += abs(len(clean) - len(variant))
-            if diff <= 1:  # Максимум 1 ошибка
+            if diff <= 2:  # Максимум 2 ошибки для более мягкого matching
                 return True
+    
+    # Проверка на содержание "kik" или "kek" или "kik" в середине
+    if "kik" in clean or "kek" in clean or "kyk" in clean or "kic" in clean:
+        return True
     
     return False
 
@@ -460,13 +500,42 @@ def is_hallucination(text: str) -> bool:
             if words[i] == words[i+1] == words[i+2]:
                 return True
     
-    # Проверка на слишком много Kiko (больше 2 в коротком тексте)
-    kiko_count = len(re.findall(r'\bkiko\b', t, re.IGNORECASE))
-    word_count = len(words)
-    if word_count > 0 and kiko_count > 2 and kiko_count / word_count > 0.5:
+    # Если текст состоит ТОЛЬКО из "kiko" (без другого контента) - галлюцинация
+    non_kiko_words = [w for w in words if w.lower() != 'kiko']
+    if len(words) > 0 and len(non_kiko_words) == 0:
         return True
     
     return False
+
+
+def clean_duplicate_kiko(text: str) -> str:
+    """Удаляет повторяющиеся 'kiko', оставляя только первый."""
+    if not text:
+        return text
+    
+    # Считаем сколько kiko в тексте
+    kiko_matches = list(re.finditer(r'\bkiko\b', text, re.IGNORECASE))
+    if len(kiko_matches) <= 1:
+        return text
+    
+    # Оставляем первый kiko, удаляем остальные
+    result = text
+    # Идём с конца чтобы индексы не сбивались
+    for match in reversed(kiko_matches[1:]):
+        start, end = match.start(), match.end()
+        # Удаляем kiko и пробел после него (если есть)
+        if end < len(result) and result[end] == ' ':
+            result = result[:start] + result[end+1:]
+        # Или пробел перед ним
+        elif start > 0 and result[start-1] == ' ':
+            result = result[:start-1] + result[end:]
+        else:
+            result = result[:start] + result[end:]
+    
+    # Убираем двойные пробелы
+    result = re.sub(r'\s+', ' ', result).strip()
+    
+    return result
 
 
 def has_sufficient_audio_energy(audio: np.ndarray) -> bool:
@@ -529,6 +598,12 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
     
     text = result["text"].strip()
     text = apply_post_correction(text)
+    
+    # Очищаем дублирующиеся "kiko" (оставляем только первый)
+    original_text = text
+    text = clean_duplicate_kiko(text)
+    if text != original_text:
+        print(f"🔧 [{session.client_id}] Cleaned duplicate kiko: {original_text!r} -> {text!r}")
     
     end_time = time.perf_counter()
     transcription_time = (end_time - start_time) * 1000
