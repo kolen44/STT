@@ -64,34 +64,37 @@ SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # int16
 
 
-# === VAD настройки (интеллектуальное определение пауз) ===
+# === VAD настройки - ОПТИМИЗИРОВАНО ДЛЯ МАКСИМАЛЬНОЙ СКОРОСТИ ===
 class VADConfig:
     # Порог энергии для определения речи
-    ENERGY_THRESHOLD = 0.012  # Увеличен для лучшей фильтрации тишины
+    ENERGY_THRESHOLD = 0.010  # Снижен для более быстрого старта
     
     # Минимальная энергия для транскрибации (защита от галлюцинаций)
-    MIN_AUDIO_ENERGY = 0.015  # Если энергия ниже - не транскрибируем вообще
+    MIN_AUDIO_ENERGY = 0.012  # Снижен
     
-    # Адаптивные паузы - УВЕЛИЧЕНЫ для лучшего определения конца фраз
-    MIN_PAUSE_MS = 800        # Минимальная пауза для коротких фраз ("да", "нет")
-    DEFAULT_PAUSE_MS = 1000   # Стандартная пауза для обычных фраз
-    MAX_PAUSE_MS = 1800       # Максимальная пауза для длинных предложений
-    QUESTION_PAUSE_MS = 800   # Для вопросов
+    # Адаптивные паузы - БЫСТРЫЕ как у ChatGPT Voice
+    MIN_PAUSE_MS = 400        # 400мс для коротких фраз
+    DEFAULT_PAUSE_MS = 550    # 550мс стандарт
+    MAX_PAUSE_MS = 800        # 800мс макс для длинных предложений
+    QUESTION_PAUSE_MS = 450   # 450мс для вопросов
     
-    # Минимальная длительность речи для обработки
-    MIN_SPEECH_MS = 300       # Увеличено для фильтрации коротких шумов
+    # Минимальная длительность речи
+    MIN_SPEECH_MS = 150       # 150мс - быстрее реагируем
     
     # Максимальная длительность сегмента
-    MAX_SEGMENT_MS = 30000    # 30 секунд макс
+    MAX_SEGMENT_MS = 60000    # 60 секунд
     
-    # Частота отправки partial results
-    PARTIAL_INTERVAL_MS = 400  # Каждые 400мс - отзывчиво
+    # Порог для мягкой финализации
+    SOFT_SEGMENT_MS = 25000   # 25 сек
+    
+    # Частота partial - УВЕЛИЧЕНА для real-time
+    PARTIAL_INTERVAL_MS = 200  # Каждые 200мс - очень быстро!
     
     # Размер VAD фрейма
-    FRAME_MS = 30             # 30мс фреймы для быстрого отклика
+    FRAME_MS = 20             # 20мс фреймы - быстрее!
     
-    # Количество фреймов для определения начала речи
-    SPEECH_START_FRAMES = 2   # 2 фрейма = 60мс для старта
+    # Количество фреймов для начала речи
+    SPEECH_START_FRAMES = 2   # 2 фрейма = 40мс для старта
 
 
 # === Hotwords для boosting ===
@@ -214,36 +217,66 @@ def is_speech_frame(audio: np.ndarray) -> bool:
 
 def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
     """
-    Интеллектуальное определение необходимой паузы.
-    Как в ChatGPT - адаптируется к контексту.
+    ИНТЕЛЛЕКТУАЛЬНОЕ определение паузы - как у ChatGPT Voice.
+    Анализирует контекст и структуру предложения для быстрого отклика.
     """
     text_lower = text.lower().strip()
+    words = text_lower.split()
+    word_count = len(words)
     
-    # 1. Короткие ответы - минимальная пауза
+    # 1. Очень короткие ответы (1-2 слова) - минимальная пауза
+    if word_count <= 2:
+        return VADConfig.MIN_PAUSE_MS
+    
+    # 2. Команды с wake word - быстрая реакция
+    has_kiko = any(w in text_lower for w in ['kiko', 'кико'])
+    if has_kiko and word_count <= 5:
+        return VADConfig.MIN_PAUSE_MS
+    
+    # 3. Явно завершённые предложения (точка, !, ?)
+    if re.search(r'[.!?]$', text_lower):
+        return VADConfig.MIN_PAUSE_MS + 50  # Немного больше для уверенности
+    
+    # 4. Короткие ответы - быстро
     for pattern in SHORT_RESPONSE_PATTERNS:
         if re.match(pattern, text_lower, re.IGNORECASE):
             return VADConfig.MIN_PAUSE_MS
     
-    # 2. Команды - короткая пауза
+    # 5. Команды - быстро
     for pattern in COMMAND_PATTERNS:
         if re.search(pattern, text_lower, re.IGNORECASE):
-            return VADConfig.MIN_PAUSE_MS + 100
+            return VADConfig.MIN_PAUSE_MS + 50
     
-    # 3. Вопросы - средняя пауза
+    # 6. Вопросы без знака вопроса в конце
     for pattern in QUESTION_PATTERNS:
         if re.search(pattern, text_lower, re.IGNORECASE):
             return VADConfig.QUESTION_PAUSE_MS
     
-    # 4. Незавершённые предложения (без знака препинания в конце)
-    if text_lower and not re.search(r'[.!?,:;]$', text_lower):
+    # 7. Незавершённые предложения - ждём дольше
+    # Признаки незавершённости:
+    #   - заканчивается на союз/предлог
+    #   - заканчивается на запятую
+    #   - последнее слово < 3 букв и не существительное
+    incomplete_endings = ['и', 'а', 'но', 'или', 'что', 'как', 'где', 'когда', 
+                         'and', 'or', 'but', 'that', 'which', 'who', 'where',
+                         'the', 'a', 'an', 'to', 'for', 'with', 'in', 'on']
+    
+    if words and words[-1] in incomplete_endings:
         return VADConfig.MAX_PAUSE_MS
     
-    # 5. По длине речи
-    if speech_duration_ms < 1000:
-        return VADConfig.MIN_PAUSE_MS
-    elif speech_duration_ms < 3000:
+    if text_lower.endswith(','):
+        return VADConfig.MAX_PAUSE_MS
+    
+    # 8. По длине речи и количеству слов
+    if word_count <= 4:
+        return VADConfig.MIN_PAUSE_MS + 100
+    elif word_count <= 8:
         return VADConfig.DEFAULT_PAUSE_MS
     else:
+        # Длинные фразы - проверяем структуру
+        # Если есть знак препинания в конце - готово
+        if re.search(r'[.!?;]$', text_lower):
+            return VADConfig.DEFAULT_PAUSE_MS
         return VADConfig.MAX_PAUSE_MS
 
 
@@ -481,7 +514,8 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
                 
                 if len(session.speech_buffer) > 0:
                     audio = np.concatenate(session.speech_buffer)
-                    if len(audio) > SAMPLE_RATE * 0.3:
+                    # Уменьшено до 200мс для более быстрых partial
+                    if len(audio) > SAMPLE_RATE * 0.2:
                         text, _ = await transcribe_audio(audio, session)
                         if text and not is_noise_or_garbage(text):
                             session.last_transcript = text
@@ -498,7 +532,7 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
         if session.state == SpeechState.SPEECH:
             session.speech_buffer.append(frame)
             
-            if session.silence_frames >= 3:  # ~90мс тишины -> переход в паузу
+            if session.silence_frames >= 2:  # ~40мс тишины -> переход в паузу (быстрее!)
                 session.state = SpeechState.PAUSE
                 session.pause_start_time = current_time
         
@@ -516,12 +550,19 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
             # Финализируем если пауза достаточная
             if pause_duration_ms >= required_pause:
                 result = await finalize_segment(session)
+            
+            # CONTINUOUS MODE: если сегмент длинный и есть короткая пауза - разбиваем
+            # Это позволяет отправлять частями длинные монологи без прерывания
+            elif speech_duration_ms > VADConfig.SOFT_SEGMENT_MS and pause_duration_ms >= 400:
+                print(f"📤 [{session.client_id}] Soft split at {speech_duration_ms:.0f}ms (continuous mode)")
+                result = await finalize_segment(session, continue_listening=True)
     
-    # Ограничиваем размер буфера
+    # Ограничиваем размер буфера - принудительное разбиение при превышении MAX - принудительное разбиение при превышении MAX
     max_samples = int(VADConfig.MAX_SEGMENT_MS * SAMPLE_RATE / 1000)
     if session.state in (SpeechState.SPEECH, SpeechState.PAUSE):
         if sum(len(b) for b in session.speech_buffer) > max_samples:
-            result = await finalize_segment(session)
+            print(f"📤 [{session.client_id}] Hard split at {VADConfig.MAX_SEGMENT_MS}ms (continuous mode)")
+            result = await finalize_segment(session, continue_listening=True)
     
     # Сохраняем фрейм для preroll
     session.audio_buffer.append(frame)
@@ -531,8 +572,13 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
     return result
 
 
-async def finalize_segment(session: ClientSession) -> Optional[dict]:
-    """Финализирует текущий сегмент речи"""
+async def finalize_segment(session: ClientSession, continue_listening: bool = False) -> Optional[dict]:
+    """Финализирует текущий сегмент речи
+    
+    Args:
+        session: Клиентская сессия
+        continue_listening: Если True - продолжаем слушать после финализации (continuous mode)
+    """
     if not session.speech_buffer:
         return None
     
@@ -541,9 +587,16 @@ async def finalize_segment(session: ClientSession) -> Optional[dict]:
     
     # Сброс состояния
     session.speech_buffer = []
-    session.state = SpeechState.SILENCE
     session.speech_frames = 0
     session.silence_frames = 0
+    
+    # CONTINUOUS MODE: остаёмся в режиме прослушивания если нужно
+    if continue_listening:
+        session.state = SpeechState.SPEECH
+        session.speech_start_time = time.time()
+        print(f"🔄 [{session.client_id}] Continuing to listen after segment...")
+    else:
+        session.state = SpeechState.SILENCE
     
     if duration_ms < VADConfig.MIN_SPEECH_MS:
         print(f"⏭️ [{session.client_id}] Segment too short ({duration_ms:.0f}ms), skipping")
