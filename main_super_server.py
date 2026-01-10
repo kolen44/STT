@@ -100,18 +100,27 @@ class VADConfig:
 # === Hotwords для boosting ===
 HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко", "Кико"]
 
-# Initial prompt для контекста
-INITIAL_PROMPT = "Kiko is a voice assistant. The user is having a conversation with Kiko. Common phrases: Hey Kiko, Kiko help, Kiko search, play music, what time is it, tell me about."
+# Initial prompt - МИНИМАЛЬНЫЙ чтобы избежать галлюцинаций!
+# НЕ используем "assistant", "voice assistant" и т.д. - Whisper повторяет их!
+INITIAL_PROMPT = None  # Отключён для предотвращения галлюцинаций
 
-# Расширенный словарь для post-correction
+# Расширенный словарь для post-correction - МНОГО вариантов для надёжного распознавания
 CORRECTION_DICT = {
-    # Английские варианты
+    # Английские варианты (все возможные произношения)
     "kiko": "Kiko", "kyko": "Kiko", "keeko": "Kiko", "kico": "Kiko",
     "kieko": "Kiko", "keyko": "Kiko", "tico": "Kiko", "tiko": "Kiko",
     "keco": "Kiko", "cico": "Kiko", "qico": "Kiko", "kika": "Kiko",
-    "kikko": "Kiko", "keko": "Kiko", "chico": "Kiko",
+    "kikko": "Kiko", "keko": "Kiko", "chico": "Kiko", "kiku": "Kiko",
+    "keeco": "Kiko", "kigo": "Kiko", "kijo": "Kiko", "kito": "Kiko",
+    "kikou": "Kiko", "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko",
+    "quico": "Kiko", "keko": "Kiko", "keekou": "Kiko", "kikov": "Kiko",
+    "kikoу": "Kiko", "keiko": "Kiko", "kico": "Kiko", "kykou": "Kiko",
+    # Whisper часто слышит как "key call" или "he called"
+    "keycall": "Kiko", "key-call": "Kiko",
     # Русские варианты
     "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko", "тико": "Kiko",
+    "кику": "Kiko", "кіку": "Kiko", "кико.": "Kiko", "кико,": "Kiko",
+    "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko",
 }
 
 # Паттерны для определения типа фразы
@@ -280,8 +289,44 @@ def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
         return VADConfig.MAX_PAUSE_MS
 
 
+# Фонетические варианты Kiko для fuzzy matching
+KIKO_PHONETIC_VARIANTS = [
+    "kiko", "kyko", "keeko", "kico", "kieko", "keyko", "tico", "tiko",
+    "keco", "cico", "qico", "kika", "kikko", "keko", "chico", "kiku",
+    "keeco", "kigo", "kijo", "kito", "kikou", "kicco", "kyco", "keiko",
+    "quico", "keekou", "kikov", "key co", "key go", "ki ko", "ki go",
+    "kee ko", "kee go", "key cool", "kekko", "geko", "gecko",
+]
+
+
+def fuzzy_match_kiko(word: str) -> bool:
+    """Проверяет, похоже ли слово на 'Kiko' (fuzzy matching)"""
+    clean = re.sub(r'[^\w]', '', word).lower()
+    
+    # Прямое совпадение
+    if clean in CORRECTION_DICT:
+        return True
+    
+    # Фонетические варианты
+    if clean in KIKO_PHONETIC_VARIANTS:
+        return True
+    
+    # Расстояние Левенштейна (простая версия)
+    if len(clean) >= 3 and len(clean) <= 6:
+        for variant in ["kiko", "keko", "kico", "kiku"]:
+            diff = sum(1 for a, b in zip(clean, variant) if a != b)
+            diff += abs(len(clean) - len(variant))
+            if diff <= 1:  # Максимум 1 ошибка
+                return True
+    
+    return False
+
+
 def apply_post_correction(text: str) -> str:
-    """Применяем пост-коррекцию текста с улучшенной логикой для множественных Kiko"""
+    """
+    Применяем пост-коррекцию текста с АГРЕССИВНЫМ поиском Kiko.
+    Ищем похожие слова и заменяем на Kiko.
+    """
     if not text:
         return text
     
@@ -295,10 +340,15 @@ def apply_post_correction(text: str) -> str:
         
         corrected = None
         
+        # 1. Прямое совпадение в словаре
         if clean_word in CORRECTION_DICT:
             corrected = CORRECTION_DICT[clean_word]
+        # 2. Fuzzy matching для "похожих на Kiko" слов
+        elif fuzzy_match_kiko(word):
+            corrected = "Kiko"
+        # 3. Близкие совпадения через difflib
         elif len(clean_word) > 2:
-            matches = get_close_matches(clean_word, CORRECTION_DICT.keys(), n=1, cutoff=0.75)
+            matches = get_close_matches(clean_word, CORRECTION_DICT.keys(), n=1, cutoff=0.70)  # Снижен порог
             if matches:
                 corrected = CORRECTION_DICT[matches[0]]
         
@@ -312,6 +362,9 @@ def apply_post_correction(text: str) -> str:
     
     # Убираем дубликаты Kiko рядом: "Kiko Kiko включи" -> "Kiko, включи"
     result = re.sub(r'\bKiko\s+Kiko\b', 'Kiko,', result, flags=re.IGNORECASE)
+    
+    # Убираем "Kiko assistant" галлюцинации
+    result = re.sub(r'\bKiko\s+assistant\b', 'Kiko', result, flags=re.IGNORECASE)
     
     return result
 
@@ -344,16 +397,22 @@ HALLUCINATION_PATTERNS = [
     r'^kiko[\s,\.]*kiko[\s,\.]*kiko',  # Повторяющееся Kiko
     r'^(kiko[\s,\.]*){{3,}}',  # Kiko 3+ раз подряд
     r'^кико[\s,\.]*кико[\s,\.]*кико',  # То же на русском
-    r'voice assistant',  # Из промпта
-    r'common phrases',  # Из промпта  
+    r'voice assistant',  # ГЛАВНЫЙ источник галлюцинаций!
+    r'kiko assistant',   # Частая галлюцинация
+    r'kiko is a',        # Галлюцинация из промпта
+    r'assistant kiko',   # Ещё вариант
+    r'common phrases',   # Из промпта  
     r'having a conversation',  # Из промпта
-    r'^\s*\.+\s*$',  # Только точки
-    r'^\s*,+\s*$',  # Только запятые
-    r'thank you for watching',  # Типичная галлюцинация
+    r'^\s*\.+\s*$',     # Только точки
+    r'^\s*,+\s*$',      # Только запятые
+    r'thank you for watching',  # Типичная галлюцинация YouTube
     r'thanks for watching',
     r'subscribe',
     r'like and subscribe',
     r'please subscribe',
+    r'^kiko\.?$',        # Просто "Kiko" без контекста (часто галлюцинация)
+    r'^kiko,?\.?$',     # "Kiko," или "Kiko."
+    r'\bthe\s+kiko\b',  # "the Kiko" - неестественно
 ]
 
 def is_noise_or_garbage(text: str) -> bool:
@@ -441,12 +500,15 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
     
     start_time = time.perf_counter()
     
-    # Контекст из предыдущих фраз (но НЕ добавляем INITIAL_PROMPT чтобы избежать галлюцинаций)
-    # Используем более короткий промпт
-    context_prompt = "Kiko assistant."
+    # Контекст - МИНИМАЛЬНЫЙ! "assistant" вызывает галлюцинации
+    # Используем только предыдущие реплики БЕЗ слова "assistant"
+    context_prompt = None  # По умолчанию без промпта
     if session.conversation_context:
-        recent = session.conversation_context[-2:]  # Меньше контекста
-        context_prompt = f"Kiko. {' '.join(recent)}"
+        recent = session.conversation_context[-2:]  # Только 2 последние фразы
+        # Фильтруем слово "assistant" из контекста
+        clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '')
+        if clean_context.strip():
+            context_prompt = clean_context.strip()
     
     result = whisper_model.transcribe(
         audio,
