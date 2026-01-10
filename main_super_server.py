@@ -72,11 +72,11 @@ class VADConfig:
     # Минимальная энергия для транскрибации (защита от галлюцинаций)
     MIN_AUDIO_ENERGY = 0.012  # Снижен
     
-    # Адаптивные паузы - БЫСТРЫЕ как у ChatGPT Voice
-    MIN_PAUSE_MS = 400        # 400мс для коротких фраз
-    DEFAULT_PAUSE_MS = 550    # 550мс стандарт
-    MAX_PAUSE_MS = 800        # 800мс макс для длинных предложений
-    QUESTION_PAUSE_MS = 450   # 450мс для вопросов
+    # Адаптивные паузы - УВЕЛИЧЕНЫ чтобы не обрезать речь
+    MIN_PAUSE_MS = 600        # 600мс для коротких фраз (было 400)
+    DEFAULT_PAUSE_MS = 800    # 800мс стандарт (было 550)
+    MAX_PAUSE_MS = 1200       # 1200мс макс для длинных предложений (было 800)
+    QUESTION_PAUSE_MS = 650   # 650мс для вопросов (было 450)
     
     # Минимальная длительность речи
     MIN_SPEECH_MS = 150       # 150мс - быстрее реагируем
@@ -95,6 +95,9 @@ class VADConfig:
     
     # Количество фреймов для начала речи
     SPEECH_START_FRAMES = 2   # 2 фрейма = 40мс для старта
+    
+    # ДЕДУПЛИКАЦИЯ - минимальный интервал между одинаковыми текстами
+    DEDUP_WINDOW_MS = 3000    # 3 секунды
 
 
 # === Hotwords для boosting ===
@@ -182,6 +185,10 @@ class ClientSession:
     # Метрики
     total_speech_ms: float = 0.0
     total_segments: int = 0
+    
+    # ДЕДУПЛИКАЦИЯ - предотвращает повторную отправку одинакового текста
+    last_sent_text: str = ""
+    last_sent_time: float = 0.0
 
 
 # Глобальное хранилище сессий
@@ -688,6 +695,32 @@ async def finalize_segment(session: ClientSession, continue_listening: bool = Fa
     if is_hallucination(text):
         print(f"🚫 [{session.client_id}] Hallucination in final: {text!r}")
         return None
+    
+    # ДЕДУПЛИКАЦИЯ: проверяем не отправляли ли мы этот текст недавно
+    current_time = time.time()
+    text_normalized = text.lower().strip()
+    last_normalized = session.last_sent_text.lower().strip() if session.last_sent_text else ""
+    
+    # Проверка на полное совпадение или очень похожий текст
+    if last_normalized and text_normalized:
+        time_since_last = (current_time - session.last_sent_time) * 1000
+        
+        # Если текст идентичен и прошло меньше DEDUP_WINDOW_MS
+        if text_normalized == last_normalized and time_since_last < VADConfig.DEDUP_WINDOW_MS:
+            print(f"🔁 [{session.client_id}] Duplicate skipped: {text!r} (sent {time_since_last:.0f}ms ago)")
+            return None
+        
+        # Если текст очень похож (один содержит другой) и прошло меньше времени
+        if time_since_last < VADConfig.DEDUP_WINDOW_MS:
+            if text_normalized in last_normalized or last_normalized in text_normalized:
+                # Если новый текст короче или равен - дубликат
+                if len(text_normalized) <= len(last_normalized):
+                    print(f"🔁 [{session.client_id}] Partial duplicate skipped: {text!r}")
+                    return None
+    
+    # Обновляем последний отправленный текст
+    session.last_sent_text = text
+    session.last_sent_time = current_time
     
     # Обновляем контекст
     session.last_transcript = text
