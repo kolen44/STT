@@ -120,8 +120,8 @@ class VADConfig:
     MAX_PAUSE_MS = 1800       # 1800мс макс для длинных предложений
     QUESTION_PAUSE_MS = 900   # 900мс для вопросов
     
-    # Минимальная длительность речи - КОРОЧЕ для коротких слов
-    MIN_SPEECH_MS = 200       # 200мс - захватывает короткие слова типа "Yes", "No"
+    # Минимальная длительность речи - баланс между захватом и стабильностью
+    MIN_SPEECH_MS = 400       # 400мс - минимум для стабильной работы Whisper
     
     # Максимальная длительность сегмента
     MAX_SEGMENT_MS = 30000    # 30 секунд
@@ -135,8 +135,8 @@ class VADConfig:
     # Размер VAD фрейма
     FRAME_MS = 20             # 20мс фреймы
     
-    # Количество фреймов для начала речи - МЕНЬШЕ для быстрого захвата
-    SPEECH_START_FRAMES = 1   # 1 фрейм = 20мс - быстрее реагирует
+    # Количество фреймов для начала речи - баланс скорости и стабильности
+    SPEECH_START_FRAMES = 2   # 2 фрейма = 40мс - стабильнее
     
     # ДЕДУПЛИКАЦИЯ
     DEDUP_WINDOW_MS = 2500    # 2.5 секунды
@@ -649,9 +649,13 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
     
     # Синхронная функция для выполнения в executor - ВЫСОКОЕ КАЧЕСТВО
     def _transcribe_sync():
+        # Защита от слишком короткого аудио (< 0.5 сек)
+        if len(audio) < SAMPLE_RATE * 0.5:
+            return {"text": "", "segments": []}
+        
         return whisper_model.transcribe(
             audio,
-            language=None,  # Автодетект языка - важно для multi-language!
+            language="en",  # Фиксированный язык для стабильности
             task="transcribe",
             initial_prompt=context_prompt,
             fp16=True,
