@@ -73,46 +73,74 @@ GPU_CLEANUP_INTERVAL = 60.0
 last_gpu_cleanup = time.time()
 
 # ===============================
-# НАСТРОЙКИ - ОПТИМИЗИРОВАННЫЕ ДЛЯ ДИАЛОГА
+# НАСТРОЙКИ - ОПТИМИЗИРОВАННЫЕ КАК У OPENAI AUDIO
 # ===============================
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # int16
 
+# === WHISPER ADVANCED SETTINGS (OpenAI-style) ===
+class WhisperConfig:
+    # Beam search для лучшего качества (как у OpenAI)
+    BEAM_SIZE = 5  # OpenAI использует 5 beams
+    BEST_OF = 5    # Выбор лучшего из N кандидатов
+    
+    # Temperature fallback для робастности
+    TEMPERATURE = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)  # Повторяет при неуверенности
+    
+    # Compression ratio - фильтр галлюцинаций
+    COMPRESSION_RATIO_THRESHOLD = 2.4  # Отбрасывает слишком сжатый текст
+    
+    # Log probability - уверенность модели
+    LOGPROB_THRESHOLD = -1.0  # Более строгий порог
+    
+    # No speech threshold
+    NO_SPEECH_THRESHOLD = 0.6
+    
+    # Condition on previous - отключено для независимости сегментов
+    CONDITION_ON_PREVIOUS = False
+    
+    # Word timestamps для точности
+    WORD_TIMESTAMPS = False  # Отключено для скорости, включить если нужна точность
+    
+    # Prepend punctuations - улучшает границы слов
+    PREPEND_PUNCTUATIONS = "\"'¿([{-"
+    APPEND_PUNCTUATIONS = "\"'.googlelr);:?!،、。」』】〗》）\n"
 
-# === VAD настройки - ОПТИМИЗИРОВАНО ДЛЯ МАКСИМАЛЬНОЙ СКОРОСТИ ===
+
+# === VAD настройки - ОПТИМИЗИРОВАНО КАК У OPENAI ===
 class VADConfig:
-    # Порог энергии для определения речи - СНИЖЕН для лучшего захвата тихого "Kiko"
-    ENERGY_THRESHOLD = 0.008  # Снижен с 0.010 для захвата тихих начал фраз
+    # Порог энергии для определения речи - адаптивный
+    ENERGY_THRESHOLD = 0.006  # Ещё ниже для захвата тихого начала "Kiko"
     
     # Минимальная энергия для транскрибации (защита от галлюцинаций)
-    MIN_AUDIO_ENERGY = 0.010  # Снижен с 0.012
+    MIN_AUDIO_ENERGY = 0.008  # Снижен для чувствительности
     
-    # Адаптивные паузы - СИЛЬНО УВЕЛИЧЕНЫ для естественной речи
-    MIN_PAUSE_MS = 900        # 900мс для коротких фраз
-    DEFAULT_PAUSE_MS = 1200   # 1200мс стандарт
-    MAX_PAUSE_MS = 1800       # 1800мс макс для длинных предложений
-    QUESTION_PAUSE_MS = 1000  # 1000мс для вопросов
+    # Адаптивные паузы - как у OpenAI (быстрый отклик)
+    MIN_PAUSE_MS = 700        # 700мс минимум (OpenAI ~500-800ms)
+    DEFAULT_PAUSE_MS = 1000   # 1000мс стандарт
+    MAX_PAUSE_MS = 1500       # 1500мс макс для длинных предложений
+    QUESTION_PAUSE_MS = 800   # 800мс для вопросов (быстрее)
     
     # Минимальная длительность речи
-    MIN_SPEECH_MS = 150       # 150мс - быстрее реагируем
+    MIN_SPEECH_MS = 100       # 100мс - очень быстрая реакция
     
     # Максимальная длительность сегмента
-    MAX_SEGMENT_MS = 60000    # 60 секунд
+    MAX_SEGMENT_MS = 30000    # 30 секунд (как у OpenAI)
     
     # Порог для мягкой финализации
-    SOFT_SEGMENT_MS = 25000   # 25 сек
+    SOFT_SEGMENT_MS = 20000   # 20 сек
     
-    # Частота partial - УВЕЛИЧЕНА для real-time
-    PARTIAL_INTERVAL_MS = 200  # Каждые 200мс - очень быстро!
+    # Частота partial - real-time feedback
+    PARTIAL_INTERVAL_MS = 150  # Каждые 150мс - ещё быстрее!
     
     # Размер VAD фрейма
-    FRAME_MS = 20             # 20мс фреймы - быстрее!
+    FRAME_MS = 20             # 20мс фреймы
     
     # Количество фреймов для начала речи
-    SPEECH_START_FRAMES = 2   # 2 фрейма = 40мс для старта
+    SPEECH_START_FRAMES = 1   # 1 фрейм = 20мс для МГНОВЕННОГО старта
     
     # ДЕДУПЛИКАЦИЯ - минимальный интервал между одинаковыми текстами
-    DEDUP_WINDOW_MS = 3000    # 3 секунды
+    DEDUP_WINDOW_MS = 2000    # 2 секунды (быстрее)
 
 
 # === Hotwords для boosting ===
@@ -703,7 +731,7 @@ def has_sufficient_audio_energy(audio: np.ndarray) -> bool:
 
 async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[str, dict]:
     """Транскрибация аудио с метриками и защитой от галлюцинаций.
-    Использует ThreadPoolExecutor чтобы не блокировать event loop.
+    Использует OpenAI-style параметры для лучшего качества.
     """
     audio_duration = len(audio) / SAMPLE_RATE
     
@@ -713,29 +741,51 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
         return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3), 
                    "realtime_factor": 0, "samples": len(audio), "skipped": "low_energy"}
     
-    # Noise gate
-    audio = audio * (np.abs(audio) > 0.008)  # Увеличен порог
+    # Noise gate - мягкий
+    audio = audio * (np.abs(audio) > 0.005)  # Мягкий порог
     
-    # Контекст - МИНИМАЛЬНЫЙ чтобы избежать галлюцинаций
+    # Нормализация громкости (как у OpenAI)
+    max_val = np.max(np.abs(audio))
+    if max_val > 0.01:
+        audio = audio / max_val * 0.95  # Нормализация до 95%
+    
+    # Контекст - только для длинных сессий
     context_prompt = None
-    if session.conversation_context:
+    if len(session.conversation_context) >= 3:
         recent = session.conversation_context[-2:]
         clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '')
-        if clean_context.strip():
+        if clean_context.strip() and len(clean_context) < 200:
             context_prompt = clean_context.strip()
     
     start_time = time.perf_counter()
     
-    # Синхронная функция для выполнения в executor
+    # Синхронная функция для выполнения в executor с OpenAI-style параметрами
     def _transcribe_sync():
         return whisper_model.transcribe(
             audio,
-            language="en",
+            language="en",  # Явно указываем язык для скорости
+            task="transcribe",
             initial_prompt=context_prompt,
             fp16=True,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6,
-            logprob_threshold=-0.8,
+            
+            # OpenAI-style beam search
+            beam_size=WhisperConfig.BEAM_SIZE,
+            best_of=WhisperConfig.BEST_OF,
+            
+            # Temperature fallback для робастности
+            temperature=WhisperConfig.TEMPERATURE,
+            
+            # Фильтры качества
+            compression_ratio_threshold=WhisperConfig.COMPRESSION_RATIO_THRESHOLD,
+            logprob_threshold=WhisperConfig.LOGPROB_THRESHOLD,
+            no_speech_threshold=WhisperConfig.NO_SPEECH_THRESHOLD,
+            
+            # Независимые сегменты
+            condition_on_previous_text=WhisperConfig.CONDITION_ON_PREVIOUS,
+            
+            # Пунктуация
+            prepend_punctuations=WhisperConfig.PREPEND_PUNCTUATIONS,
+            append_punctuations=WhisperConfig.APPEND_PUNCTUATIONS,
         )
     
     try:
