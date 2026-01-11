@@ -108,11 +108,11 @@ class WhisperConfig:
 
 # === VAD настройки - ОПТИМИЗИРОВАНО ДЛЯ КАЧЕСТВА ===
 class VADConfig:
-    # Порог энергии для определения речи - МЯГЧЕ для тихой речи
-    ENERGY_THRESHOLD = 0.005  # Ниже для захвата тихих слов
+    # Порог энергии для определения речи - ОЧЕНЬ МЯГКИЙ для RTSP
+    ENERGY_THRESHOLD = 0.003  # Ниже для захвата тихих слов
     
-    # Минимальная энергия для транскрибации - МЯГЧЕ
-    MIN_AUDIO_ENERGY = 0.008  # Ниже для лучшего захвата
+    # Минимальная энергия для транскрибации - ОЧЕНЬ МЯГКИЙ
+    MIN_AUDIO_ENERGY = 0.004  # Низкий порог для RTSP микрофона
     
     # Адаптивные паузы - баланс скорости и точности
     MIN_PAUSE_MS = 800        # 800мс минимум
@@ -120,8 +120,8 @@ class VADConfig:
     MAX_PAUSE_MS = 1800       # 1800мс макс для длинных предложений
     QUESTION_PAUSE_MS = 900   # 900мс для вопросов
     
-    # Минимальная длительность речи - баланс между захватом и стабильностью
-    MIN_SPEECH_MS = 400       # 400мс - минимум для стабильной работы Whisper
+    # Минимальная длительность речи - УВЕЛИЧЕНА для стабильности Whisper
+    MIN_SPEECH_MS = 600       # 600мс - минимум для избежания sequence error
     
     # Максимальная длительность сегмента
     MAX_SEGMENT_MS = 30000    # 30 секунд
@@ -535,6 +535,15 @@ def is_noise_or_garbage(text: str) -> bool:
     if re.match(r'^(.)\1{2,}$', t):
         return True
     
+    # Фильтр мусорных звуков: Grrrr, hmmm, aaah, etc.
+    t_lower = t.lower().rstrip('!')
+    # Повторяющиеся буквы: grrrr, hmmm, aaaa
+    if re.match(r'^([a-z])\1{2,}$', t_lower):
+        return True
+    # Короткие междометия
+    if t_lower in ['hmm', 'hm', 'uh', 'um', 'ah', 'oh', 'eh', 'mm', 'mhm', 'ugh', 'grr', 'grrr', 'grrrr', 'aah', 'ooh']:
+        return True
+    
     return False
 
 
@@ -657,8 +666,8 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     
     # Синхронная функция для выполнения в executor - ВЫСОКОЕ КАЧЕСТВО
     def _transcribe_sync():
-        # Защита от слишком короткого аудио (< 0.5 сек)
-        if len(audio) < SAMPLE_RATE * 0.5:
+        # Защита от слишком короткого аудио (< 0.8 сек) - предотвращает sequence error
+        if len(audio) < SAMPLE_RATE * 0.8:
             return {"text": "", "segments": []}
         
         return whisper_model.transcribe(
