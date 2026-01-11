@@ -23,7 +23,6 @@ import base64
 import time
 from collections import defaultdict
 import re
-from difflib import get_close_matches
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
@@ -78,139 +77,94 @@ last_gpu_cleanup = time.time()
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # int16
 
-# === WHISPER ADVANCED SETTINGS (OpenAI-style) ===
+# === WHISPER ADVANCED SETTINGS - ОПТИМИЗИРОВАНО ДЛЯ КАЧЕСТВА ===
 class WhisperConfig:
-    # Beam search для лучшего качества (как у OpenAI)
-    BEAM_SIZE = 5  # OpenAI использует 5 beams
-    BEST_OF = 5    # Выбор лучшего из N кандидатов
+    # Beam search для лучшего качества
+    BEAM_SIZE = 5      # 5 beams - баланс качества/скорости
+    BEST_OF = 5        # Выбор лучшего из 5 кандидатов
     
-    # Temperature fallback для робастности
-    TEMPERATURE = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)  # Повторяет при неуверенности
+    # Temperature - НИЗКАЯ для стабильности, fallback при неуверенности
+    TEMPERATURE = (0.0, 0.2, 0.4)  # Меньше вариантов = стабильнее
     
     # Compression ratio - фильтр галлюцинаций
-    COMPRESSION_RATIO_THRESHOLD = 2.4  # Отбрасывает слишком сжатый текст
+    COMPRESSION_RATIO_THRESHOLD = 2.4
     
-    # Log probability - уверенность модели
-    LOGPROB_THRESHOLD = -1.0  # Более строгий порог
+    # Log probability - уверенность модели (более строгий порог)
+    LOGPROB_THRESHOLD = -0.8  # -0.8 вместо -1.0 для большей уверенности
     
-    # No speech threshold
-    NO_SPEECH_THRESHOLD = 0.6
+    # No speech threshold - строже
+    NO_SPEECH_THRESHOLD = 0.5  # 0.5 вместо 0.6 - строже
     
-    # Condition on previous - отключено для независимости сегментов
+    # Condition on previous - отключено для независимости
     CONDITION_ON_PREVIOUS = False
     
-    # Word timestamps для точности
-    WORD_TIMESTAMPS = False  # Отключено для скорости, включить если нужна точность
+    # Word timestamps - ВКЛЮЧЕНО для точности
+    WORD_TIMESTAMPS = True  # Улучшает точность распознавания
     
-    # Prepend punctuations - улучшает границы слов
+    # Punctuations
     PREPEND_PUNCTUATIONS = "\"'¿([{-"
-    APPEND_PUNCTUATIONS = "\"'.googlelr);:?!،、。」』】〗》）\n"
+    APPEND_PUNCTUATIONS = "\"'.;googlelr);:?!،、。」』】〗》）\n"
 
 
-# === VAD настройки - ОПТИМИЗИРОВАНО КАК У OPENAI ===
+# === VAD настройки - ОПТИМИЗИРОВАНО ДЛЯ КАЧЕСТВА ===
 class VADConfig:
-    # Порог энергии для определения речи - адаптивный
-    ENERGY_THRESHOLD = 0.006  # Ещё ниже для захвата тихого начала "Kiko"
+    # Порог энергии для определения речи
+    ENERGY_THRESHOLD = 0.008  # Чуть выше для фильтрации шума
     
     # Минимальная энергия для транскрибации (защита от галлюцинаций)
-    MIN_AUDIO_ENERGY = 0.008  # Снижен для чувствительности
+    MIN_AUDIO_ENERGY = 0.012  # Выше для лучшей фильтрации
     
-    # Адаптивные паузы - как у OpenAI (быстрый отклик)
-    MIN_PAUSE_MS = 700        # 700мс минимум (OpenAI ~500-800ms)
-    DEFAULT_PAUSE_MS = 1000   # 1000мс стандарт
-    MAX_PAUSE_MS = 1500       # 1500мс макс для длинных предложений
-    QUESTION_PAUSE_MS = 800   # 800мс для вопросов (быстрее)
+    # Адаптивные паузы - баланс скорости и точности
+    MIN_PAUSE_MS = 800        # 800мс минимум
+    DEFAULT_PAUSE_MS = 1200   # 1200мс стандарт
+    MAX_PAUSE_MS = 1800       # 1800мс макс для длинных предложений
+    QUESTION_PAUSE_MS = 900   # 900мс для вопросов
     
-    # Минимальная длительность речи
-    MIN_SPEECH_MS = 100       # 100мс - очень быстрая реакция
+    # Минимальная длительность речи - ВАЖНО ДЛЯ КАЧЕСТВА
+    MIN_SPEECH_MS = 300       # 300мс - достаточно для качественной транскрибации
     
     # Максимальная длительность сегмента
-    MAX_SEGMENT_MS = 30000    # 30 секунд (как у OpenAI)
+    MAX_SEGMENT_MS = 30000    # 30 секунд
     
     # Порог для мягкой финализации
     SOFT_SEGMENT_MS = 20000   # 20 сек
     
-    # Частота partial - real-time feedback
-    PARTIAL_INTERVAL_MS = 150  # Каждые 150мс - ещё быстрее!
+    # Частота partial - баланс скорости/качества
+    PARTIAL_INTERVAL_MS = 300  # 300мс - реже для лучшего качества
     
     # Размер VAD фрейма
     FRAME_MS = 20             # 20мс фреймы
     
     # Количество фреймов для начала речи
-    SPEECH_START_FRAMES = 1   # 1 фрейм = 20мс для МГНОВЕННОГО старта
+    SPEECH_START_FRAMES = 2   # 2 фрейма = 40мс - стабильнее
     
-    # ДЕДУПЛИКАЦИЯ - минимальный интервал между одинаковыми текстами
-    DEDUP_WINDOW_MS = 2000    # 2 секунды (быстрее)
+    # ДЕДУПЛИКАЦИЯ
+    DEDUP_WINDOW_MS = 2500    # 2.5 секунды
 
 
 # === Hotwords для boosting ===
 HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко", "Кико"]
 
 # Количество preroll фреймов - УВЕЛИЧЕНО для захвата начала фразы с Kiko
-PREROLL_FRAMES = 15  # 15 фреймов = 300мс preroll (было 5 = 100мс)
+PREROLL_FRAMES = 20  # 20 фреймов = 400мс preroll для лучшего захвата начала
 
-# Расширенный словарь для post-correction - уровень Алисы
+# Словарь для post-correction - ТОЛЬКО явные ошибки распознавания Kiko
+# НЕ включаем обычные английские слова!
 CORRECTION_DICT = {
-    # Основные английские варианты
+    # Прямые фонетические варианты Kiko
     "kiko": "Kiko", "kyko": "Kiko", "keeko": "Kiko", "kico": "Kiko",
-    "kieko": "Kiko", "keyko": "Kiko", "tico": "Kiko", "tiko": "Kiko",
-    "keco": "Kiko", "cico": "Kiko", "qico": "Kiko", "kika": "Kiko",
-    "kikko": "Kiko", "keko": "Kiko", "chico": "Kiko", "kiku": "Kiko",
-    "keeco": "Kiko", "kigo": "Kiko", "kijo": "Kiko", "kito": "Kiko",
-    "kikou": "Kiko", "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko",
-    "quico": "Kiko", "keekou": "Kiko", "kikov": "Kiko", "keiko": "Kiko",
-    # Whisper ошибки - слышит как другие слова
-    "keycall": "Kiko", "key-call": "Kiko", "kicker": "Kiko",
-    "ticker": "Kiko", "picker": "Kiko", "clicker": "Kiko",
-    "gecko": "Kiko", "geko": "Kiko", "geeko": "Kiko",
-    "eagle": "Kiko", "legal": "Kiko", "sequel": "Kiko",
-    "he go": "Kiko", "key go": "Kiko", "key cool": "Kiko",
-    "ki ko": "Kiko", "ki go": "Kiko", "kee ko": "Kiko",
-    # Начало фразы с hey/ok
-    "hey kiko": "Kiko", "hey kyko": "Kiko", "ok kiko": "Kiko", "okay kiko": "Kiko",
-    "hi kiko": "Kiko", "hi kyko": "Kiko",
-    # Дополнительные английские варианты с ошибками распознавания
-    "kika": "Kiko", "kyeka": "Kiko", "kyka": "Kiko", "keeka": "Kiko",
-    "keekou": "Kiko", "kykou": "Kiko", "kicko": "Kiko", "kiekko": "Kiko",
-    "key call": "Kiko", "key cold": "Kiko", "keyco": "Kiko",
-    "kee call": "Kiko", "kee cold": "Kiko", "keecold": "Kiko",
-    "cheeko": "Kiko", "cheako": "Kiko", "chicko": "Kiko",
-    "geo": "Kiko", "theo": "Kiko", "leo": "Kiko",  # частые ошибки при тихом произношении
-    "echo": "Kiko", "ecko": "Kiko", "eko": "Kiko",
-    "niko": "Kiko", "nico": "Kiko", "nikko": "Kiko", "nicko": "Kiko",
-    "miko": "Kiko", "mico": "Kiko", "mikko": "Kiko",
-    "riko": "Kiko", "rico": "Kiko", "rikko": "Kiko",
-    "pico": "Kiko", "piko": "Kiko", "pikko": "Kiko",
-    "viko": "Kiko", "vico": "Kiko", "vikko": "Kiko",
-    "fiko": "Kiko", "fico": "Kiko",
-    # Начало фразы - дополнительные варианты
-    "a kiko": "Kiko", "akiko": "Kiko", "oh kiko": "Kiko", "o kiko": "Kiko",
-    "yo kiko": "Kiko", "yo kyko": "Kiko", "hey keeko": "Kiko",
-    "hey keko": "Kiko", "hi keeko": "Kiko", "hi keko": "Kiko",
-    "ahkiko": "Kiko", "uh kiko": "Kiko", "uhkiko": "Kiko",
-    # Русские варианты - расширенный список
-    "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko", "тико": "Kiko",
+    "kieko": "Kiko", "keyko": "Kiko", "kikko": "Kiko", "keko": "Kiko",
+    "keeco": "Kiko", "kigo": "Kiko", "kiku": "Kiko", "kikou": "Kiko",
+    "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko",
+    "keekou": "Kiko", "kikov": "Kiko",
+    # Только явные двухсловные варианты с kiko
+    "hey kiko": "Kiko", "ok kiko": "Kiko", "okay kiko": "Kiko",
+    "hi kiko": "Kiko", "oh kiko": "Kiko",
+    # Русские варианты
+    "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko",
     "кику": "Kiko", "кіку": "Kiko", "кико.": "Kiko", "кико,": "Kiko",
-    "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko", "кэко": "Kiko", "кэку": "Kiko",
-    "кіка": "Kiko", "ківко": "Kiko", "кіго": "Kiko",
-    # Дополнительные русские варианты
-    "кикко": "Kiko", "кекко": "Kiko", "тіко": "Kiko", "тіка": "Kiko",
-    "кикоу": "Kiko", "кикоо": "Kiko", "кикa": "Kiko",
-    "кінко": "Kiko", "кінка": "Kiko", "кенко": "Kiko", "кенка": "Kiko",
-    "кик": "Kiko", "кік": "Kiko", "кек": "Kiko",
-    "кіку": "Kiko", "кику": "Kiko", "кеку": "Kiko",
-    "кикі": "Kiko", "кики": "Kiko", "кикє": "Kiko",
-    "чіко": "Kiko", "чико": "Kiko", "чіка": "Kiko", "чика": "Kiko",
-    "нико": "Kiko", "ніко": "Kiko", "ніка": "Kiko", "ника": "Kiko",
-    "мико": "Kiko", "міко": "Kiko", "міка": "Kiko", "мика": "Kiko",
-    "ріко": "Kiko", "рико": "Kiko", "ріка": "Kiko", "рика": "Kiko",
-    "піко": "Kiko", "піка": "Kiko", "пико": "Kiko", "пика": "Kiko",
-    "віко": "Kiko", "віка": "Kiko", "вико": "Kiko", "вика": "Kiko",
-    # Русские начала фраз
-    "эй кико": "Kiko", "эй кіко": "Kiko", "ей кико": "Kiko",
-    "окей кико": "Kiko", "окей кіко": "Kiko", "о кико": "Kiko",
-    "а кико": "Kiko", "а кіко": "Kiko", "ах кико": "Kiko",
-    "хей кико": "Kiko", "хей кіко": "Kiko", "хай кико": "Kiko",
+    "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko", "кэко": "Kiko",
+    "кікко": "Kiko", "кикко": "Kiko", "кекко": "Kiko",
 }
 
 # Паттерны для определения типа фразы
@@ -398,79 +352,40 @@ def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
         return VADConfig.MAX_PAUSE_MS
 
 
-# Фонетические варианты Kiko для fuzzy matching (расширенный список уровня Алисы)
+# Фонетические варианты Kiko - ТОЛЬКО явные варианты, без обычных слов
 KIKO_PHONETIC_VARIANTS = [
-    # Основные варианты
-    "kiko", "kyko", "keeko", "kico", "kieko", "keyko", "tico", "tiko",
-    "keco", "cico", "qico", "kika", "kikko", "keko", "chico", "kiku",
-    "keeco", "kigo", "kijo", "kito", "kikou", "kicco", "kyco", "keiko",
-    "quico", "keekou", "kikov", "key co", "key go", "ki ko", "ki go",
-    "kee ko", "kee go", "key cool", "kekko", "geko", "gecko",
-    # Дополнительные фонетические совпадения
-    "kika", "kikou", "keeku", "kiku", "keeku", "kieko", "kyeku",
-    "kico", "gico", "hiko", "iko", "ikko", "kiku", "kicu",
-    "keiku", "keico", "keigo", "keijo", "keikou", "kikoh", "kikow",
-    # Whisper часто распознает как эти слова
-    "he go", "key goal", "kegal", "legal", "eagle", "sequel",
-    "kicker", "ticker", "picker", "quicker", "clicker",
-    # Начало фразы может быть распознано как
-    "hey kiko", "hey kyko", "ok kiko", "okay kiko",
+    # Основные варианты - звучат как "kiko"
+    "kiko", "kyko", "keeko", "kico", "kieko", "keyko",
+    "kikko", "keko", "kiku", "keeco", "kigo", "kikou",
+    "kicco", "kyco", "keekou", "kikov",
     # Русские варианты
-    "кико", "кіко", "кика", "кеко", "тико", "кику", "кіку",
-    "киго", "кійко", "кийко", "кэко", "кэку", "кіка",
-    # Дополнительные варианты с ошибками распознавания
-    "niko", "nico", "nikko", "nicko", "miko", "mico", "mikko",
-    "riko", "rico", "rikko", "pico", "piko", "pikko", "viko", "vico",
-    "fiko", "fico", "echo", "ecko", "eko", "geo", "theo", "leo",
-    "kicko", "kiekko", "cheeko", "cheako", "chicko",
-    "key call", "key cold", "keyco", "kee call", "kee cold", "keecold",
-    "akiko", "yo kiko", "yo kyko", "hey keeko", "hey keko",
-    # Русские дополнительные варианты
-    "кикко", "кекко", "тіко", "тіка", "кикоу", "кикоо",
-    "кінко", "кінка", "кенко", "кенка", "кик", "кік", "кек",
-    "чіко", "чико", "чіка", "чика", "нико", "ніко", "ніка", "ника",
-    "мико", "міко", "міка", "мика", "ріко", "рико", "ріка", "рика",
-    "піко", "піка", "пико", "пика", "віко", "віка", "вико", "вика",
+    "кико", "кіко", "кика", "кеко", "кику", "кіку",
+    "киго", "кійко", "кийко", "кэко", "кікко", "кикко",
 ]
 
 
 def fuzzy_match_kiko(word: str) -> bool:
-    """Проверяет, похоже ли слово на 'Kiko' (fuzzy matching уровня Алисы)"""
+    """Проверяет, похоже ли слово на 'Kiko' - СТРОГАЯ версия"""
     clean = re.sub(r'[^\w]', '', word).lower()
     
-    # Пустое слово
-    if not clean:
+    # Пустое слово или слишком короткое/длинное
+    if not clean or len(clean) < 3 or len(clean) > 6:
         return False
     
-    # Прямое совпадение
+    # Прямое совпадение в словаре
     if clean in CORRECTION_DICT:
         return True
     
-    # Фонетические варианты
+    # Фонетические варианты (строгий список)
     if clean in KIKO_PHONETIC_VARIANTS:
         return True
     
-    # Проверка на начало с ki/ke/ky + окончание o/u/a
-    if len(clean) >= 3 and len(clean) <= 7:
-        # Паттерн: начинается с k/c/q + гласная, заканчивается на o/u/a/oh
-        if re.match(r'^[kcqg][ieyae][kcgqt]?[oua]h?$', clean):
-            return True
-        # Паттерн: kik/kek/kyk + любое окончание
-        if re.match(r'^[kcq][iey][kcq]', clean):
-            return True
+    # Строгий паттерн: только k + i/y + k/c + o
+    if re.match(r'^k[iy]k?[ckg]?o$', clean):
+        return True
     
-    # Расстояние Левенштейна - расширенный список референсов
-    if len(clean) >= 3 and len(clean) <= 7:
-        for variant in ["kiko", "keko", "kico", "kiku", "keiko", "kyko", "kikko"]:
-            if len(clean) > len(variant) + 2:
-                continue
-            diff = sum(1 for a, b in zip(clean, variant) if a != b)
-            diff += abs(len(clean) - len(variant))
-            if diff <= 2:  # Максимум 2 ошибки для более мягкого matching
-                return True
-    
-    # Проверка на содержание "kik" или "kek" или "kik" в середине
-    if "kik" in clean or "kek" in clean or "kyk" in clean or "kic" in clean:
+    # Русский паттерн: к + и/і + к + о
+    if re.match(r'^к[иіе]к?[кг]?о$', clean):
         return True
     
     return False
@@ -478,8 +393,8 @@ def fuzzy_match_kiko(word: str) -> bool:
 
 def apply_post_correction(text: str) -> str:
     """
-    Применяем пост-коррекцию текста с АГРЕССИВНЫМ поиском Kiko.
-    Ищем похожие слова и заменяем на Kiko.
+    Применяем пост-коррекцию текста - СТРОГАЯ версия.
+    Заменяем только явные варианты Kiko, не трогаем обычные слова.
     """
     if not text:
         return text
@@ -494,17 +409,12 @@ def apply_post_correction(text: str) -> str:
         
         corrected = None
         
-        # 1. Прямое совпадение в словаре
+        # ТОЛЬКО прямое совпадение в словаре - никакого fuzzy matching!
         if clean_word in CORRECTION_DICT:
             corrected = CORRECTION_DICT[clean_word]
-        # 2. Fuzzy matching для "похожих на Kiko" слов
-        elif fuzzy_match_kiko(word):
+        # Строгий fuzzy match только для явных вариантов Kiko
+        elif fuzzy_match_kiko(clean_word):
             corrected = "Kiko"
-        # 3. Близкие совпадения через difflib
-        elif len(clean_word) > 2:
-            matches = get_close_matches(clean_word, CORRECTION_DICT.keys(), n=1, cutoff=0.70)  # Снижен порог
-            if matches:
-                corrected = CORRECTION_DICT[matches[0]]
         
         if corrected:
             final_word = punctuation_before + corrected + punctuation_after
@@ -517,17 +427,13 @@ def apply_post_correction(text: str) -> str:
     # Убираем дубликаты Kiko рядом: "Kiko Kiko включи" -> "Kiko, включи"
     result = re.sub(r'\bKiko\s+Kiko\b', 'Kiko,', result, flags=re.IGNORECASE)
     
-    # Убираем "Kiko assistant" галлюцинации
-    result = re.sub(r'\bKiko\s+assistant\b', 'Kiko', result, flags=re.IGNORECASE)
-    
     return result
 
 
 def check_first_word_is_kiko(text: str) -> str:
     """
     Проверяет первое слово на похожесть с Kiko и исправляет если нужно.
-    Это дополнительная проверка для случаев когда Whisper неправильно 
-    распознал начало фразы.
+    СТРОГАЯ версия - только явные варианты Kiko, не трогаем обычные слова.
     """
     if not text or len(text) < 2:
         return text
@@ -538,26 +444,14 @@ def check_first_word_is_kiko(text: str) -> str:
     
     first_word = words[0].lower().strip('.,!?')
     
-    # Слова которые в начале фразы почти наверняка должны быть "Kiko"
-    # (обращение к ассистенту)
+    # ТОЛЬКО явные фонетические варианты Kiko - НЕ обычные английские слова!
     kiko_like_starts = [
-        # Прямые варианты
-        "kiko", "keko", "kico", "kika", "kyko", "keeko", "kiku",
-        "kikko", "kicco", "keyko", "keiko", "kieko",
-        # Whisper ошибки в начале фразы
-        "he", "he's", "hey", "hego", "ego", "eco", "echo",
-        "key", "keys", "keego", "kee", "ki", "ky",
-        "chico", "cheeko", "chicko",
-        "geo", "theo", "leo", "neo",
-        "niko", "nico", "nikko", "miko", "mico",
-        "pico", "piko", "rico", "riko", "viko", "fico",
-        "ticker", "kicker", "picker", "clicker",
-        "eagle", "legal", "sequel",
-        "tico", "tiko", "dico", "diko",
+        # Прямые варианты звучащие как "kiko"
+        "kiko", "keko", "kico", "kyko", "keeko", "kiku",
+        "kikko", "kicco", "keyko", "kieko", "kikou",
         # Русские варианты
-        "кико", "кіко", "кика", "кеко", "тико", "кику",
-        "кикко", "кекко", "ківко", "чіко", "чико",
-        "нико", "ніко", "міко", "мико", "ріко", "рико",
+        "кико", "кіко", "кика", "кеко", "кику",
+        "кикко", "кекко",
     ]
     
     # Проверяем первое слово
@@ -565,17 +459,13 @@ def check_first_word_is_kiko(text: str) -> str:
         words[0] = "Kiko"
         return ' '.join(words)
     
-    # Проверяем двухсловные комбинации в начале
+    # Проверяем ТОЛЬКО явные двухсловные комбинации с kiko
     if len(words) >= 2:
         two_words = f"{words[0]} {words[1]}".lower()
         kiko_like_two_words = [
-            "he go", "key go", "ki go", "kee go",
-            "he cool", "key cool", "ki cool",
-            "hey go", "hey co", "hey ko",
-            "he ko", "key ko", "kee ko",
             "hey kiko", "hey kyko", "ok kiko", "okay kiko",
-            "hi kiko", "hi kyko", "a kiko", "oh kiko",
-            "эй кико", "хей кико", "о кико", "а кико",
+            "hi kiko", "hi kyko", "oh kiko",
+            "эй кико", "хей кико", "о кико",
         ]
         if two_words in kiko_like_two_words:
             # Заменяем первые два слова на Kiko
@@ -759,7 +649,7 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
     
     start_time = time.perf_counter()
     
-    # Синхронная функция для выполнения в executor с OpenAI-style параметрами
+    # Синхронная функция для выполнения в executor - ВЫСОКОЕ КАЧЕСТВО
     def _transcribe_sync():
         return whisper_model.transcribe(
             audio,
@@ -768,11 +658,11 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
             initial_prompt=context_prompt,
             fp16=True,
             
-            # OpenAI-style beam search
+            # Beam search для качества
             beam_size=WhisperConfig.BEAM_SIZE,
             best_of=WhisperConfig.BEST_OF,
             
-            # Temperature fallback для робастности
+            # Temperature - низкая для стабильности
             temperature=WhisperConfig.TEMPERATURE,
             
             # Фильтры качества
@@ -782,6 +672,9 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
             
             # Независимые сегменты
             condition_on_previous_text=WhisperConfig.CONDITION_ON_PREVIOUS,
+            
+            # Word timestamps для точности
+            word_timestamps=WhisperConfig.WORD_TIMESTAMPS,
             
             # Пунктуация
             prepend_punctuations=WhisperConfig.PREPEND_PUNCTUATIONS,
@@ -875,8 +768,8 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
                 
                 if len(session.speech_buffer) > 0:
                     audio = np.concatenate(session.speech_buffer)
-                    # Уменьшено до 200мс для более быстрых partial
-                    if len(audio) > SAMPLE_RATE * 0.2:
+                    # 400мс минимум для качественного partial
+                    if len(audio) > SAMPLE_RATE * 0.4:
                         text, _ = await transcribe_audio(audio, session)
                         if text and not is_noise_or_garbage(text):
                             session.last_transcript = text
