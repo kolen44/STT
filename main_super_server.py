@@ -567,33 +567,39 @@ def is_hallucination(text: str) -> bool:
 
 
 def clean_duplicate_kiko(text: str) -> str:
-    """Удаляет повторяющиеся 'kiko', оставляя только первый."""
+    """Удаляет повторяющиеся 'kiko', оставляя только первый.
+    Также убирает пунктуацию рядом с удалёнными kiko.
+    """
     if not text:
         return text
     
-    # Считаем сколько kiko в тексте
+    # Считаем сколько kiko в тексте (включая с пунктуацией рядом)
     kiko_matches = list(re.finditer(r'\bkiko\b', text, re.IGNORECASE))
     if len(kiko_matches) <= 1:
         return text
     
-    # Оставляем первый kiko, удаляем остальные
+    # Удаляем все kiko кроме первого, вместе с окружающей пунктуацией
     result = text
     # Идём с конца чтобы индексы не сбивались
     for match in reversed(kiko_matches[1:]):
         start, end = match.start(), match.end()
-        # Удаляем kiko и пробел после него (если есть)
-        if end < len(result) and result[end] == ' ':
-            result = result[:start] + result[end+1:]
-        # Или пробел перед ним
-        elif start > 0 and result[start-1] == ' ':
-            result = result[:start-1] + result[end:]
-        else:
-            result = result[:start] + result[end:]
+        
+        # Расширяем диапазон удаления на пунктуацию и пробелы вокруг
+        while start > 0 and result[start-1] in ' ,.:;!?':
+            start -= 1
+        while end < len(result) and result[end] in ' ,.:;!?':
+            end += 1
+            
+        result = result[:start] + ' ' + result[end:]
     
-    # Убираем двойные пробелы
-    result = re.sub(r'\s+', ' ', result).strip()
+    # Убираем двойные пробелы и лишнюю пунктуацию
+    result = re.sub(r'\s+', ' ', result)
+    result = re.sub(r'\s*,\s*,+', ',', result)  # ,, -> ,
+    result = re.sub(r'\s*\.\s*\.+', '.', result)  # .. -> .
+    result = re.sub(r',\s*\.', '.', result)  # ,. -> .
+    result = re.sub(r'\.\s*,', '.', result)  # ., -> .
     
-    return result
+    return result.strip()
 
 
 def has_sufficient_audio_energy(audio: np.ndarray) -> bool:
@@ -619,15 +625,17 @@ def has_sufficient_audio_energy(audio: np.ndarray) -> bool:
 # ГЛАВНАЯ ЛОГИКА ОБРАБОТКИ
 # ===============================
 
-async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[str, dict]:
+async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial: bool = False) -> Tuple[str, dict]:
     """Транскрибация аудио с метриками и защитой от галлюцинаций.
     Использует OpenAI-style параметры для лучшего качества.
+    is_partial=True подавляет verbose логирование.
     """
     audio_duration = len(audio) / SAMPLE_RATE
     
     # ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ: проверяем энергию аудио перед транскрибацией
     if not has_sufficient_audio_energy(audio):
-        print(f"⚠️ [{session.client_id}] Audio energy too low, skipping transcription")
+        if not is_partial:  # Не спамим для partial
+            print(f"⚠️ [{session.client_id}] Audio energy too low, skipping transcription")
         return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3), 
                    "realtime_factor": 0, "samples": len(audio), "skipped": "low_energy"}
     
@@ -707,13 +715,13 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
     # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если первое слово похоже на Kiko - исправляем
     original_first_word = text
     text = check_first_word_is_kiko(text)
-    if text != original_first_word:
+    if text != original_first_word and not is_partial:
         print(f"🔧 [{session.client_id}] Fixed first word to Kiko: {original_first_word!r} -> {text!r}")
     
     # Очищаем дублирующиеся "kiko" (оставляем только первый)
     original_text = text
     text = clean_duplicate_kiko(text)
-    if text != original_text:
+    if text != original_text and not is_partial:
         print(f"🔧 [{session.client_id}] Cleaned duplicate kiko: {original_text!r} -> {text!r}")
     
     end_time = time.perf_counter()
@@ -772,7 +780,7 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
                     audio = np.concatenate(session.speech_buffer)
                     # 400мс минимум для качественного partial
                     if len(audio) > SAMPLE_RATE * 0.4:
-                        text, _ = await transcribe_audio(audio, session)
+                        text, _ = await transcribe_audio(audio, session, is_partial=True)
                         if text and not is_noise_or_garbage(text):
                             session.last_transcript = text
                             result = {
