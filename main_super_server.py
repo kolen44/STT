@@ -127,11 +127,48 @@ CORRECTION_DICT = {
     # Начало фразы с hey/ok
     "hey kiko": "Kiko", "hey kyko": "Kiko", "ok kiko": "Kiko", "okay kiko": "Kiko",
     "hi kiko": "Kiko", "hi kyko": "Kiko",
-    # Русские варианты
+    # Дополнительные английские варианты с ошибками распознавания
+    "kika": "Kiko", "kyeka": "Kiko", "kyka": "Kiko", "keeka": "Kiko",
+    "keekou": "Kiko", "kykou": "Kiko", "kicko": "Kiko", "kiekko": "Kiko",
+    "key call": "Kiko", "key cold": "Kiko", "keyco": "Kiko",
+    "kee call": "Kiko", "kee cold": "Kiko", "keecold": "Kiko",
+    "cheeko": "Kiko", "cheako": "Kiko", "chicko": "Kiko",
+    "geo": "Kiko", "theo": "Kiko", "leo": "Kiko",  # частые ошибки при тихом произношении
+    "echo": "Kiko", "ecko": "Kiko", "eko": "Kiko",
+    "niko": "Kiko", "nico": "Kiko", "nikko": "Kiko", "nicko": "Kiko",
+    "miko": "Kiko", "mico": "Kiko", "mikko": "Kiko",
+    "riko": "Kiko", "rico": "Kiko", "rikko": "Kiko",
+    "pico": "Kiko", "piko": "Kiko", "pikko": "Kiko",
+    "viko": "Kiko", "vico": "Kiko", "vikko": "Kiko",
+    "fiko": "Kiko", "fico": "Kiko",
+    # Начало фразы - дополнительные варианты
+    "a kiko": "Kiko", "akiko": "Kiko", "oh kiko": "Kiko", "o kiko": "Kiko",
+    "yo kiko": "Kiko", "yo kyko": "Kiko", "hey keeko": "Kiko",
+    "hey keko": "Kiko", "hi keeko": "Kiko", "hi keko": "Kiko",
+    "ahkiko": "Kiko", "uh kiko": "Kiko", "uhkiko": "Kiko",
+    # Русские варианты - расширенный список
     "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko", "тико": "Kiko",
     "кику": "Kiko", "кіку": "Kiko", "кико.": "Kiko", "кико,": "Kiko",
     "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko", "кэко": "Kiko", "кэку": "Kiko",
-    "кіка": "Kiko",
+    "кіка": "Kiko", "ківко": "Kiko", "кіго": "Kiko",
+    # Дополнительные русские варианты
+    "кикко": "Kiko", "кекко": "Kiko", "тіко": "Kiko", "тіка": "Kiko",
+    "кикоу": "Kiko", "кикоо": "Kiko", "кикa": "Kiko",
+    "кінко": "Kiko", "кінка": "Kiko", "кенко": "Kiko", "кенка": "Kiko",
+    "кик": "Kiko", "кік": "Kiko", "кек": "Kiko",
+    "кіку": "Kiko", "кику": "Kiko", "кеку": "Kiko",
+    "кикі": "Kiko", "кики": "Kiko", "кикє": "Kiko",
+    "чіко": "Kiko", "чико": "Kiko", "чіка": "Kiko", "чика": "Kiko",
+    "нико": "Kiko", "ніко": "Kiko", "ніка": "Kiko", "ника": "Kiko",
+    "мико": "Kiko", "міко": "Kiko", "міка": "Kiko", "мика": "Kiko",
+    "ріко": "Kiko", "рико": "Kiko", "ріка": "Kiko", "рика": "Kiko",
+    "піко": "Kiko", "піка": "Kiko", "пико": "Kiko", "пика": "Kiko",
+    "віко": "Kiko", "віка": "Kiko", "вико": "Kiko", "вика": "Kiko",
+    # Русские начала фраз
+    "эй кико": "Kiko", "эй кіко": "Kiko", "ей кико": "Kiko",
+    "окей кико": "Kiko", "окей кіко": "Kiko", "о кико": "Kiko",
+    "а кико": "Kiko", "а кіко": "Kiko", "ах кико": "Kiko",
+    "хей кико": "Kiko", "хей кіко": "Kiko", "хай кико": "Kiko",
 }
 
 # Паттерны для определения типа фразы
@@ -324,6 +361,19 @@ KIKO_PHONETIC_VARIANTS = [
     # Русские варианты
     "кико", "кіко", "кика", "кеко", "тико", "кику", "кіку",
     "киго", "кійко", "кийко", "кэко", "кэку", "кіка",
+    # Дополнительные варианты с ошибками распознавания
+    "niko", "nico", "nikko", "nicko", "miko", "mico", "mikko",
+    "riko", "rico", "rikko", "pico", "piko", "pikko", "viko", "vico",
+    "fiko", "fico", "echo", "ecko", "eko", "geo", "theo", "leo",
+    "kicko", "kiekko", "cheeko", "cheako", "chicko",
+    "key call", "key cold", "keyco", "kee call", "kee cold", "keecold",
+    "akiko", "yo kiko", "yo kyko", "hey keeko", "hey keko",
+    # Русские дополнительные варианты
+    "кикко", "кекко", "тіко", "тіка", "кикоу", "кикоо",
+    "кінко", "кінка", "кенко", "кенка", "кик", "кік", "кек",
+    "чіко", "чико", "чіка", "чика", "нико", "ніко", "ніка", "ника",
+    "мико", "міко", "міка", "мика", "ріко", "рико", "ріка", "рика",
+    "піко", "піка", "пико", "пика", "віко", "віка", "вико", "вика",
 ]
 
 
