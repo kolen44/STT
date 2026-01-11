@@ -84,16 +84,16 @@ class WhisperConfig:
     BEST_OF = 5        # Выбор лучшего из 5 кандидатов
     
     # Temperature - НИЗКАЯ для стабильности, fallback при неуверенности
-    TEMPERATURE = (0.0, 0.2, 0.4)  # Меньше вариантов = стабильнее
+    TEMPERATURE = (0.0, 0.2, 0.4, 0.6, 0.8)  # Больше fallback вариантов
     
-    # Compression ratio - фильтр галлюцинаций
-    COMPRESSION_RATIO_THRESHOLD = 2.4
+    # Compression ratio - фильтр галлюцинаций (чуть мягче)
+    COMPRESSION_RATIO_THRESHOLD = 2.6
     
-    # Log probability - уверенность модели (более строгий порог)
-    LOGPROB_THRESHOLD = -0.8  # -0.8 вместо -1.0 для большей уверенности
+    # Log probability - МЯГЧЕ для лучшего распознавания
+    LOGPROB_THRESHOLD = -1.2  # Мягче - не отбрасывает неуверенные слова
     
-    # No speech threshold - строже
-    NO_SPEECH_THRESHOLD = 0.5  # 0.5 вместо 0.6 - строже
+    # No speech threshold - баланс
+    NO_SPEECH_THRESHOLD = 0.6  # Стандартное значение Whisper
     
     # Condition on previous - отключено для независимости
     CONDITION_ON_PREVIOUS = False
@@ -108,11 +108,11 @@ class WhisperConfig:
 
 # === VAD настройки - ОПТИМИЗИРОВАНО ДЛЯ КАЧЕСТВА ===
 class VADConfig:
-    # Порог энергии для определения речи
-    ENERGY_THRESHOLD = 0.008  # Чуть выше для фильтрации шума
+    # Порог энергии для определения речи - МЯГЧЕ для тихой речи
+    ENERGY_THRESHOLD = 0.005  # Ниже для захвата тихих слов
     
-    # Минимальная энергия для транскрибации (защита от галлюцинаций)
-    MIN_AUDIO_ENERGY = 0.012  # Выше для лучшей фильтрации
+    # Минимальная энергия для транскрибации - МЯГЧЕ
+    MIN_AUDIO_ENERGY = 0.008  # Ниже для лучшего захвата
     
     # Адаптивные паузы - баланс скорости и точности
     MIN_PAUSE_MS = 800        # 800мс минимум
@@ -120,8 +120,8 @@ class VADConfig:
     MAX_PAUSE_MS = 1800       # 1800мс макс для длинных предложений
     QUESTION_PAUSE_MS = 900   # 900мс для вопросов
     
-    # Минимальная длительность речи - ВАЖНО ДЛЯ КАЧЕСТВА
-    MIN_SPEECH_MS = 300       # 300мс - достаточно для качественной транскрибации
+    # Минимальная длительность речи - КОРОЧЕ для коротких слов
+    MIN_SPEECH_MS = 200       # 200мс - захватывает короткие слова типа "Yes", "No"
     
     # Максимальная длительность сегмента
     MAX_SEGMENT_MS = 30000    # 30 секунд
@@ -135,8 +135,8 @@ class VADConfig:
     # Размер VAD фрейма
     FRAME_MS = 20             # 20мс фреймы
     
-    # Количество фреймов для начала речи
-    SPEECH_START_FRAMES = 2   # 2 фрейма = 40мс - стабильнее
+    # Количество фреймов для начала речи - МЕНЬШЕ для быстрого захвата
+    SPEECH_START_FRAMES = 1   # 1 фрейм = 20мс - быстрее реагирует
     
     # ДЕДУПЛИКАЦИЯ
     DEDUP_WINDOW_MS = 2500    # 2.5 секунды
@@ -145,8 +145,8 @@ class VADConfig:
 # === Hotwords для boosting ===
 HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко", "Кико"]
 
-# Количество preroll фреймов - УВЕЛИЧЕНО для захвата начала фразы с Kiko
-PREROLL_FRAMES = 20  # 20 фреймов = 400мс preroll для лучшего захвата начала
+# Количество preroll фреймов - УВЕЛИЧЕНО для захвата начала слов
+PREROLL_FRAMES = 25  # 25 фреймов = 500мс preroll для лучшего захвата начала
 
 # Словарь для post-correction - ТОЛЬКО явные ошибки распознавания Kiko
 # НЕ включаем обычные английские слова!
@@ -631,10 +631,8 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
         return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3), 
                    "realtime_factor": 0, "samples": len(audio), "skipped": "low_energy"}
     
-    # Noise gate - мягкий
-    audio = audio * (np.abs(audio) > 0.005)  # Мягкий порог
-    
-    # Нормализация громкости (как у OpenAI)
+    # УБРАН noise gate - он резал тихие звуки!
+    # Только лёгкая нормализация громкости (как у OpenAI)
     max_val = np.max(np.abs(audio))
     if max_val > 0.01:
         audio = audio / max_val * 0.95  # Нормализация до 95%
@@ -653,7 +651,7 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
     def _transcribe_sync():
         return whisper_model.transcribe(
             audio,
-            language="en",  # Явно указываем язык для скорости
+            language=None,  # Автодетект языка - важно для multi-language!
             task="transcribe",
             initial_prompt=context_prompt,
             fp16=True,
