@@ -28,6 +28,10 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import threading
+import gc
+from concurrent.futures import ThreadPoolExecutor
+import signal
+import sys as _sys
 
 # ============ ЗАГРУЗКА МОДЕЛИ ============
 print("=" * 80)
@@ -57,6 +61,17 @@ print(f"📊 Режим: {device.upper()} | ChatGPT-style диалог")
 print("=" * 80)
 print()
 
+# ThreadPoolExecutor для блокирующих операций (Whisper)
+# Используем 2 воркера чтобы не перегружать GPU
+whisper_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper_")
+
+# Таймаут для транскрибации (секунды)
+TRANSCRIBE_TIMEOUT = 30.0
+
+# Интервал очистки GPU памяти (секунды)
+GPU_CLEANUP_INTERVAL = 60.0
+last_gpu_cleanup = time.time()
+
 # ===============================
 # НАСТРОЙКИ - ОПТИМИЗИРОВАННЫЕ ДЛЯ ДИАЛОГА
 # ===============================
@@ -66,11 +81,11 @@ BYTES_PER_SAMPLE = 2  # int16
 
 # === VAD настройки - ОПТИМИЗИРОВАНО ДЛЯ МАКСИМАЛЬНОЙ СКОРОСТИ ===
 class VADConfig:
-    # Порог энергии для определения речи
-    ENERGY_THRESHOLD = 0.010  # Снижен для более быстрого старта
+    # Порог энергии для определения речи - СНИЖЕН для лучшего захвата тихого "Kiko"
+    ENERGY_THRESHOLD = 0.008  # Снижен с 0.010 для захвата тихих начал фраз
     
     # Минимальная энергия для транскрибации (защита от галлюцинаций)
-    MIN_AUDIO_ENERGY = 0.012  # Снижен
+    MIN_AUDIO_ENERGY = 0.010  # Снижен с 0.012
     
     # Адаптивные паузы - СИЛЬНО УВЕЛИЧЕНЫ для естественной речи
     MIN_PAUSE_MS = 900        # 900мс для коротких фраз
@@ -103,9 +118,8 @@ class VADConfig:
 # === Hotwords для boosting ===
 HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко", "Кико"]
 
-# Initial prompt - МИНИМАЛЬНЫЙ чтобы избежать галлюцинаций!
-# НЕ используем "assistant", "voice assistant" и т.д. - Whisper повторяет их!
-INITIAL_PROMPT = None  # Отключён для предотвращения галлюцинаций
+# Количество preroll фреймов - УВЕЛИЧЕНО для захвата начала фразы с Kiko
+PREROLL_FRAMES = 15  # 15 фреймов = 300мс preroll (было 5 = 100мс)
 
 # Расширенный словарь для post-correction - уровень Алисы
 CORRECTION_DICT = {
@@ -238,7 +252,22 @@ class ClientSession:
 
 # Глобальное хранилище сессий
 sessions: Dict[str, ClientSession] = {}
-sessions_lock = threading.Lock()
+sessions_lock = asyncio.Lock()  # asyncio Lock вместо threading Lock для async контекста
+
+
+async def cleanup_gpu_memory():
+    """Периодическая очистка GPU памяти для предотвращения утечек"""
+    global last_gpu_cleanup
+    current_time = time.time()
+    if current_time - last_gpu_cleanup > GPU_CLEANUP_INTERVAL:
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+            last_gpu_cleanup = current_time
+            print(f"🧹 GPU memory cleanup performed")
+        except Exception as e:
+            print(f"⚠️ GPU cleanup error: {e}")
 
 
 # ===============================
@@ -466,6 +495,67 @@ def apply_post_correction(text: str) -> str:
     return result
 
 
+def check_first_word_is_kiko(text: str) -> str:
+    """
+    Проверяет первое слово на похожесть с Kiko и исправляет если нужно.
+    Это дополнительная проверка для случаев когда Whisper неправильно 
+    распознал начало фразы.
+    """
+    if not text or len(text) < 2:
+        return text
+    
+    words = text.split()
+    if not words:
+        return text
+    
+    first_word = words[0].lower().strip('.,!?')
+    
+    # Слова которые в начале фразы почти наверняка должны быть "Kiko"
+    # (обращение к ассистенту)
+    kiko_like_starts = [
+        # Прямые варианты
+        "kiko", "keko", "kico", "kika", "kyko", "keeko", "kiku",
+        "kikko", "kicco", "keyko", "keiko", "kieko",
+        # Whisper ошибки в начале фразы
+        "he", "he's", "hey", "hego", "ego", "eco", "echo",
+        "key", "keys", "keego", "kee", "ki", "ky",
+        "chico", "cheeko", "chicko",
+        "geo", "theo", "leo", "neo",
+        "niko", "nico", "nikko", "miko", "mico",
+        "pico", "piko", "rico", "riko", "viko", "fico",
+        "ticker", "kicker", "picker", "clicker",
+        "eagle", "legal", "sequel",
+        "tico", "tiko", "dico", "diko",
+        # Русские варианты
+        "кико", "кіко", "кика", "кеко", "тико", "кику",
+        "кикко", "кекко", "ківко", "чіко", "чико",
+        "нико", "ніко", "міко", "мико", "ріко", "рико",
+    ]
+    
+    # Проверяем первое слово
+    if first_word in kiko_like_starts:
+        words[0] = "Kiko"
+        return ' '.join(words)
+    
+    # Проверяем двухсловные комбинации в начале
+    if len(words) >= 2:
+        two_words = f"{words[0]} {words[1]}".lower()
+        kiko_like_two_words = [
+            "he go", "key go", "ki go", "kee go",
+            "he cool", "key cool", "ki cool",
+            "hey go", "hey co", "hey ko",
+            "he ko", "key ko", "kee ko",
+            "hey kiko", "hey kyko", "ok kiko", "okay kiko",
+            "hi kiko", "hi kyko", "a kiko", "oh kiko",
+            "эй кико", "хей кико", "о кико", "а кико",
+        ]
+        if two_words in kiko_like_two_words:
+            # Заменяем первые два слова на Kiko
+            return "Kiko " + ' '.join(words[2:]) if len(words) > 2 else "Kiko"
+    
+    return text
+
+
 def get_speaker_hash(audio_data: np.ndarray) -> str:
     """Улучшенный идентификатор спикера"""
     if len(audio_data) == 0:
@@ -612,7 +702,9 @@ def has_sufficient_audio_energy(audio: np.ndarray) -> bool:
 # ===============================
 
 async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[str, dict]:
-    """Транскрибация аудио с метриками и защитой от галлюцинаций."""
+    """Транскрибация аудио с метриками и защитой от галлюцинаций.
+    Использует ThreadPoolExecutor чтобы не блокировать event loop.
+    """
     audio_duration = len(audio) / SAMPLE_RATE
     
     # ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ: проверяем энергию аудио перед транскрибацией
@@ -624,30 +716,54 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession) -> Tuple[s
     # Noise gate
     audio = audio * (np.abs(audio) > 0.008)  # Увеличен порог
     
-    start_time = time.perf_counter()
-    
-    # Контекст - МИНИМАЛЬНЫЙ! "assistant" вызывает галлюцинации
-    # Используем только предыдущие реплики БЕЗ слова "assistant"
-    context_prompt = None  # По умолчанию без промпта
+    # Контекст - МИНИМАЛЬНЫЙ чтобы избежать галлюцинаций
+    context_prompt = None
     if session.conversation_context:
-        recent = session.conversation_context[-2:]  # Только 2 последние фразы
-        # Фильтруем слово "assistant" из контекста
+        recent = session.conversation_context[-2:]
         clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '')
         if clean_context.strip():
             context_prompt = clean_context.strip()
     
-    result = whisper_model.transcribe(
-        audio,
-        language="en",
-        initial_prompt=context_prompt,
-        fp16=True,
-        condition_on_previous_text=False,  # ОТКЛЮЧЕНО для предотвращения галлюцинаций
-        no_speech_threshold=0.6,  # Увеличен порог "нет речи"
-        logprob_threshold=-0.8,   # Более строгий порог вероятности
-    )
+    start_time = time.perf_counter()
+    
+    # Синхронная функция для выполнения в executor
+    def _transcribe_sync():
+        return whisper_model.transcribe(
+            audio,
+            language="en",
+            initial_prompt=context_prompt,
+            fp16=True,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+            logprob_threshold=-0.8,
+        )
+    
+    try:
+        # Выполняем блокирующую транскрибацию в отдельном потоке с таймаутом
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(whisper_executor, _transcribe_sync),
+            timeout=TRANSCRIBE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        print(f"⚠️ [{session.client_id}] Transcription timeout after {TRANSCRIBE_TIMEOUT}s")
+        return "", {"transcription_time_ms": TRANSCRIBE_TIMEOUT * 1000, 
+                   "audio_duration_s": round(audio_duration, 3),
+                   "error": "timeout"}
+    except Exception as e:
+        print(f"❌ [{session.client_id}] Transcription error: {e}")
+        return "", {"transcription_time_ms": 0, 
+                   "audio_duration_s": round(audio_duration, 3),
+                   "error": str(e)}
     
     text = result["text"].strip()
     text = apply_post_correction(text)
+    
+    # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если первое слово похоже на Kiko - исправляем
+    original_first_word = text
+    text = check_first_word_is_kiko(text)
+    if text != original_first_word:
+        print(f"🔧 [{session.client_id}] Fixed first word to Kiko: {original_first_word!r} -> {text!r}")
     
     # Очищаем дублирующиеся "kiko" (оставляем только первый)
     original_text = text
@@ -692,8 +808,9 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
             if session.speech_frames >= VADConfig.SPEECH_START_FRAMES:
                 session.state = SpeechState.SPEECH
                 session.speech_start_time = current_time
-                session.speech_buffer = list(session.audio_buffer[-5:])  # Preroll
-                print(f"🎤 [{session.client_id}] Speech started")
+                # УВЕЛИЧЕННЫЙ Preroll для захвата начала фразы с Kiko
+                session.speech_buffer = list(session.audio_buffer[-PREROLL_FRAMES:])
+                print(f"🎤 [{session.client_id}] Speech started (preroll: {len(session.speech_buffer)} frames)")
         
         elif session.state == SpeechState.PAUSE:
             session.state = SpeechState.SPEECH
@@ -758,9 +875,9 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
             print(f"📤 [{session.client_id}] Hard split at {VADConfig.MAX_SEGMENT_MS}ms (continuous mode)")
             result = await finalize_segment(session, continue_listening=True)
     
-    # Сохраняем фрейм для preroll
+    # Сохраняем фрейм для preroll - УВЕЛИЧЕННЫЙ буфер
     session.audio_buffer.append(frame)
-    if len(session.audio_buffer) > 10:
+    if len(session.audio_buffer) > PREROLL_FRAMES + 5:  # +5 запас
         session.audio_buffer.pop(0)
     
     return result
@@ -879,7 +996,7 @@ async def handle_client(websocket):
     
     # Создаём чистую сессию (защита от проблем при перезагрузке)
     session = ClientSession(client_id=client_id)
-    with sessions_lock:
+    async with sessions_lock:
         # Удаляем старую сессию если была (при быстром переподключении)
         if client_id in sessions:
             print(f"♻️ [{client_id}] Cleaning up previous session")
@@ -894,6 +1011,9 @@ async def handle_client(websocket):
     # Счётчик тишины для предотвращения галлюцинаций при перезагрузке
     silence_streak = 0
     MAX_SILENCE_BEFORE_SKIP = 50  # ~1.5 сек тишины подряд = скипаем обработку
+    
+    # Счётчик для периодической очистки
+    message_counter = 0
     
     try:
         await websocket.send(json.dumps({
@@ -920,10 +1040,19 @@ async def handle_client(websocket):
                     if not audio_b64:
                         continue
                     
-                    audio_chunk = np.frombuffer(
-                        base64.b64decode(audio_b64),
-                        dtype=np.int16
-                    ).astype(np.float32) / 32768.0
+                    # Периодическая очистка GPU памяти (каждые 1000 сообщений)
+                    message_counter += 1
+                    if message_counter % 1000 == 0:
+                        await cleanup_gpu_memory()
+                    
+                    try:
+                        audio_chunk = np.frombuffer(
+                            base64.b64decode(audio_b64),
+                            dtype=np.int16
+                        ).astype(np.float32) / 32768.0
+                    except Exception as e:
+                        print(f"⚠️ [{client_id}] Audio decode error: {e}")
+                        continue
                     
                     # Проверяем энергию чанка для отслеживания тишины
                     chunk_energy = calculate_energy(audio_chunk)
@@ -1043,28 +1172,95 @@ async def handle_client(websocket):
         print(f"   ⏱️  Общее время речи: {session.total_speech_ms/1000:.1f}с")
         print(f"   🎭 Спикеров: {session.speaker_counter}")
         
-        with sessions_lock:
+        # Очищаем буферы сессии
+        session.audio_buffer.clear()
+        session.speech_buffer.clear()
+        session.conversation_context.clear()
+        
+        async with sessions_lock:
             if client_id in sessions:
                 del sessions[client_id]
+        
+        # Очищаем GPU память после отключения клиента
+        await cleanup_gpu_memory()
 
 
 async def main():
-    """Запуск WebSocket сервера"""
+    """Запуск WebSocket сервера с graceful shutdown"""
+    
+    # Обработка сигналов для graceful shutdown
+    stop_event = asyncio.Event()
+    
+    def signal_handler():
+        print("\n🛑 Получен сигнал завершения...")
+        stop_event.set()
+    
+    # Регистрируем обработчики сигналов
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, signal_handler)
+        except NotImplementedError:
+            # Windows не поддерживает add_signal_handler
+            pass
+    
     server = await websockets.serve(
         handle_client,
         "0.0.0.0",
         8765,
         ping_interval=20,
         ping_timeout=20,
-        max_size=10 * 1024 * 1024  # 10MB max message size
+        max_size=10 * 1024 * 1024,  # 10MB max message size
+        close_timeout=10,  # Таймаут закрытия соединения
     )
     
     print("🎧 Ожидаю подключений...")
-    await server.wait_closed()
+    
+    # Фоновая задача для периодической очистки памяти
+    async def periodic_cleanup():
+        while not stop_event.is_set():
+            await asyncio.sleep(GPU_CLEANUP_INTERVAL)
+            await cleanup_gpu_memory()
+            # Логируем состояние сессий
+            async with sessions_lock:
+                if sessions:
+                    print(f"📊 Активных сессий: {len(sessions)}")
+    
+    cleanup_task = asyncio.create_task(periodic_cleanup())
+    
+    try:
+        await stop_event.wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print("🔄 Завершаю сервер...")
+        cleanup_task.cancel()
+        server.close()
+        await server.wait_closed()
+        
+        # Закрываем executor
+        whisper_executor.shutdown(wait=True, cancel_futures=True)
+        
+        # Финальная очистка GPU
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
+        print("✅ Сервер остановлен")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Сервер остановлен")
+        print("\n\n👋 Сервер остановлен по Ctrl+C")
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Финальная очистка
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        print("🧹 Ресурсы освобождены")
