@@ -741,13 +741,13 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     # Финальная проверка типа - ОБЯЗАТЕЛЬНО float32 для Whisper!
     audio = audio.astype(np.float32)
     
-    # Контекст - оптимизированный prompt для Kiko
-    context_prompt = "Kiko"  # Базовый prompt для boosting wake word
+    # Контекст - БЕЗ Kiko в промпте (вызывало галлюцинации)
+    context_prompt = None
     if len(session.conversation_context) >= 2:
         recent = session.conversation_context[-2:]
-        clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '')
+        clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '').replace('Kiko', '').replace('kiko', '')
         if clean_context.strip() and len(clean_context) < 150:
-            context_prompt = f"Kiko. {clean_context.strip()}"
+            context_prompt = clean_context.strip()
     
     start_time = time.perf_counter()
     
