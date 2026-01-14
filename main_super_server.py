@@ -721,13 +721,8 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     # Финальная проверка типа - ОБЯЗАТЕЛЬНО float32 для Whisper!
     audio = audio.astype(np.float32)
     
-    # Контекст - БЕЗ Optimus в промпте (вызывало галлюцинации)
-    context_prompt = None
-    if len(session.conversation_context) >= 2:
-        recent = session.conversation_context[-2:]
-        clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '').replace('Optimus', '').replace('optimus', '')
-        if clean_context.strip() and len(clean_context) < 150:
-            context_prompt = clean_context.strip()
+    # ПРОМПТ ОТКЛЮЧЁН - вызывал галлюцинации и ухудшал распознавание
+    # context_prompt = None
     
     start_time = time.perf_counter()
     
@@ -746,7 +741,7 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
                     audio,
                     language="en",  # Фиксированный язык для стабильности
                     task="transcribe",
-                    initial_prompt=context_prompt,
+                    # initial_prompt ОТКЛЮЧЁН
                     fp16=True,
                     
                     # Beam search для качества
