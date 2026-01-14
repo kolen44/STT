@@ -1,21 +1,19 @@
 """
-WebSocket STT сервер v2.3 - ИСПРАВЛЕН dtype error
+WebSocket STT сервер v2.4 - ИСПРАВЛЕН фильтр галлюцинаций
 OpenAI Whisper Medium на GPU + Picovoice Porcupine Wake Word
 
-Улучшения v2.3:
-- ИСПРАВЛЕНО: float vs double dtype error при предобработке аудио
-- Явное приведение к float32 на всех этапах обработки
-- Beam search 7 для лучшего качества коротких фраз
-- Улучшенная предобработка аудио (DC offset, high-pass filter, RMS нормализация)
-- Расширенный словарь коррекции Kiko (60+ вариантов)
-- Быстрые паузы (650-1500мс) для отзывчивости
-- Preroll 600мс для захвата начала слов
+Улучшения v2.4:
+- ИСПРАВЛЕНО: одиночное "Kiko" больше не фильтруется как галлюцинация
+- ИСПРАВЛЕНО: ошибка websocket при shutdown (ConnectionClosedOK)
+- Убраны паттерны r'^kiko\.?$' и r'^kiko,?\.?$' из HALLUCINATION_PATTERNS
+- Добавлена защита от ConnectionClosed при отправке сообщений
 """
 import warnings
 warnings.filterwarnings("ignore")
 
 import asyncio
 import websockets
+import websockets.exceptions
 import json
 import whisper
 import torch
@@ -557,8 +555,8 @@ def get_speaker_hash(audio_data: np.ndarray) -> str:
 
 # Паттерны галлюцинаций Whisper (текст из промпта или повторения)
 HALLUCINATION_PATTERNS = [
-    r'^kiko[\s,\.]*kiko[\s,\.]*kiko',  # Повторяющееся Kiko
-    r'^(kiko[\s,\.]*){{3,}}',  # Kiko 3+ раз подряд
+    r'^kiko[\s,\.]*kiko[\s,\.]*kiko',  # Повторяющееся Kiko 3+ раз
+    r'^(kiko[\s,\.]*){4,}',  # Kiko 4+ раз подряд (увеличено с 3)
     r'^кико[\s,\.]*кико[\s,\.]*кико',  # То же на русском
     r'voice assistant',  # ГЛАВНЫЙ источник галлюцинаций!
     r'kiko assistant',   # Частая галлюцинация
@@ -573,8 +571,8 @@ HALLUCINATION_PATTERNS = [
     r'subscribe',
     r'like and subscribe',
     r'please subscribe',
-    r'^kiko\.?$',        # Просто "Kiko" без контекста (часто галлюцинация)
-    r'^kiko,?\.?$',     # "Kiko," или "Kiko."
+    # УБРАНО: r'^kiko\.?$' - это валидный wake word!
+    # УБРАНО: r'^kiko,?\.?$' - это валидный wake word!
     r'\bthe\s+kiko\b',  # "the Kiko" - неестественно
 ]
 
@@ -625,10 +623,11 @@ def is_hallucination(text: str) -> bool:
             if words[i] == words[i+1] == words[i+2]:
                 return True
     
-    # Если текст состоит ТОЛЬКО из "kiko" (без другого контента) - галлюцинация
-    non_kiko_words = [w for w in words if w.lower() != 'kiko']
-    if len(words) > 0 and len(non_kiko_words) == 0:
-        return True
+    # УБРАНО: одиночное "Kiko" - это валидный wake word!
+    # Теперь НЕ фильтруем одиночное Kiko - это нормальная активация ассистента
+    # non_kiko_words = [w for w in words if w.lower() != 'kiko']
+    # if len(words) > 0 and len(non_kiko_words) == 0:
+    #     return True
     
     return False
 
@@ -1168,21 +1167,27 @@ async def handle_client(websocket):
                         
                         result = await process_vad_frame(session, frame, websocket)
                         if result:
-                            await websocket.send(json.dumps(result))
+                            try:
+                                await websocket.send(json.dumps(result))
+                            except websockets.exceptions.ConnectionClosed:
+                                return  # Клиент отключился
                 
                 elif msg_type == "finalize":
                     # Принудительная финализация
                     if session.state != SpeechState.SILENCE:
                         result = await finalize_segment(session)
-                        if result:
-                            await websocket.send(json.dumps(result))
-                        else:
-                            await websocket.send(json.dumps({
-                                "type": "transcription",
-                                "text": "",
-                                "is_final": True,
-                                "timestamp": datetime.now().isoformat(),
-                            }))
+                        try:
+                            if result:
+                                await websocket.send(json.dumps(result))
+                            else:
+                                await websocket.send(json.dumps({
+                                    "type": "transcription",
+                                    "text": "",
+                                    "is_final": True,
+                                    "timestamp": datetime.now().isoformat(),
+                                }))
+                        except websockets.exceptions.ConnectionClosed:
+                            return  # Клиент отключился
                     else:
                         if len(pcm_buffer) > frame_samples:
                             session.speech_buffer = [pcm_buffer]
