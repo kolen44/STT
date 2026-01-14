@@ -154,15 +154,16 @@ PREROLL_FRAMES = 25  # 25 фреймов = 500мс preroll для лучшего
 # Словарь для post-correction - ТОЛЬКО явные ошибки распознавания Kiko
 # НЕ включаем обычные английские слова!
 CORRECTION_DICT = {
-    # Прямые фонетические варианты Kiko
-    "kiko": "Kiko", "kyko": "Kiko", "keeko": "Kiko", "kico": "Kiko",
+    # Прямые фонетические варианты Kiko (включая Kika!)
+    "kiko": "Kiko", "kika": "Kiko", "kyko": "Kiko", "keeko": "Kiko", "kico": "Kiko",
     "kieko": "Kiko", "keyko": "Kiko", "kikko": "Kiko", "keko": "Kiko",
     "keeco": "Kiko", "kigo": "Kiko", "kiku": "Kiko", "kikou": "Kiko",
-    "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko",
-    "keekou": "Kiko", "kikov": "Kiko",
-    # Только явные двухсловные варианты с kiko
-    "hey kiko": "Kiko", "ok kiko": "Kiko", "okay kiko": "Kiko",
-    "hi kiko": "Kiko", "oh kiko": "Kiko",
+    "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko", "kika's": "Kiko",
+    "keekou": "Kiko", "kikov": "Kiko", "kikka": "Kiko", "kica": "Kiko",
+    # Только явные двухсловные варианты с kiko/kika
+    "hey kiko": "Kiko", "hey kika": "Kiko", "ok kiko": "Kiko", "ok kika": "Kiko",
+    "okay kiko": "Kiko", "okay kika": "Kiko", "hi kiko": "Kiko", "hi kika": "Kiko",
+    "oh kiko": "Kiko", "oh kika": "Kiko",
     # Русские варианты
     "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko",
     "кику": "Kiko", "кіку": "Kiko", "кико.": "Kiko", "кико,": "Kiko",
@@ -204,6 +205,10 @@ class ClientSession:
     """Состояние клиентской сессии"""
     client_id: str
     
+    # Время создания сессии
+    created_at: float = field(default_factory=time.time)
+    last_activity: float = field(default_factory=time.time)
+    
     # Аудио буферы
     audio_buffer: List[np.ndarray] = field(default_factory=list)
     speech_buffer: List[np.ndarray] = field(default_factory=list)
@@ -240,7 +245,32 @@ sessions: Dict[str, ClientSession] = {}
 sessions_lock = asyncio.Lock()  # asyncio Lock вместо threading Lock для async контекста
 
 # Максимальное количество одновременных сессий (защита от перегрузки)
-MAX_CONCURRENT_SESSIONS = 20
+MAX_CONCURRENT_SESSIONS = 50
+
+# Таймаут неактивной сессии (секунды) - сессии без активности удаляются
+SESSION_IDLE_TIMEOUT = 120.0  # 2 минуты
+
+
+async def cleanup_stale_sessions():
+    """Удаляет зависшие сессии которые не отправляли данные долгое время"""
+    current_time = time.time()
+    stale_ids = []
+    
+    async with sessions_lock:
+        for client_id, session in sessions.items():
+            # Используем last_activity для отслеживания активности
+            idle_time = current_time - session.last_activity
+            
+            if idle_time > SESSION_IDLE_TIMEOUT:
+                stale_ids.append(client_id)
+        
+        # Удаляем зависшие сессии
+        for client_id in stale_ids:
+            print(f"🗑️ [{client_id}] Removing stale session (idle > {SESSION_IDLE_TIMEOUT}s)")
+            del sessions[client_id]
+    
+    if stale_ids:
+        print(f"🧹 Cleaned up {len(stale_ids)} stale sessions")
 
 
 async def cleanup_gpu_memory(force: bool = False):
@@ -251,6 +281,9 @@ async def cleanup_gpu_memory(force: bool = False):
     # Принудительная очистка или по таймеру
     if force or current_time - last_gpu_cleanup > GPU_CLEANUP_INTERVAL:
         try:
+            # Сначала очищаем зависшие сессии
+            await cleanup_stale_sessions()
+            
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 gc.collect()
@@ -365,10 +398,10 @@ def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
 
 # Фонетические варианты Kiko - ТОЛЬКО явные варианты, без обычных слов
 KIKO_PHONETIC_VARIANTS = [
-    # Основные варианты - звучат как "kiko"
-    "kiko", "kyko", "keeko", "kico", "kieko", "keyko",
-    "kikko", "keko", "kiku", "keeco", "kigo", "kikou",
-    "kicco", "kyco", "keekou", "kikov",
+    # Основные варианты - звучат как "kiko" или "kika"
+    "kiko", "kika", "kyko", "keeko", "kico", "kieko", "keyko",
+    "kikko", "kikka", "keko", "kiku", "keeco", "kigo", "kikou",
+    "kicco", "kica", "kyco", "keekou", "kikov",
     # Русские варианты
     "кико", "кіко", "кика", "кеко", "кику", "кіку",
     "киго", "кійко", "кийко", "кэко", "кікко", "кикко",
@@ -457,9 +490,9 @@ def check_first_word_is_kiko(text: str) -> str:
     
     # ТОЛЬКО явные фонетические варианты Kiko - НЕ обычные английские слова!
     kiko_like_starts = [
-        # Прямые варианты звучащие как "kiko"
-        "kiko", "keko", "kico", "kyko", "keeko", "kiku",
-        "kikko", "kicco", "keyko", "kieko", "kikou",
+        # Прямые варианты звучащие как "kiko" или "kika"
+        "kiko", "kika", "keko", "kico", "kica", "kyko", "keeko", "kiku",
+        "kikko", "kikka", "kicco", "keyko", "kieko", "kikou",
         # Русские варианты
         "кико", "кіко", "кика", "кеко", "кику",
         "кикко", "кекко",
@@ -470,13 +503,13 @@ def check_first_word_is_kiko(text: str) -> str:
         words[0] = "Kiko"
         return ' '.join(words)
     
-    # Проверяем ТОЛЬКО явные двухсловные комбинации с kiko
+    # Проверяем ТОЛЬКО явные двухсловные комбинации с kiko/kika
     if len(words) >= 2:
         two_words = f"{words[0]} {words[1]}".lower()
         kiko_like_two_words = [
-            "hey kiko", "hey kyko", "ok kiko", "okay kiko",
-            "hi kiko", "hi kyko", "oh kiko",
-            "эй кико", "хей кико", "о кико",
+            "hey kiko", "hey kika", "hey kyko", "ok kiko", "ok kika", "okay kiko", "okay kika",
+            "hi kiko", "hi kika", "hi kyko", "oh kiko", "oh kika",
+            "эй кико", "хей кико", "о кико", "эй кика", "хей кика",
         ]
         if two_words in kiko_like_two_words:
             # Заменяем первые два слова на Kiko
@@ -1046,6 +1079,9 @@ async def handle_client(websocket):
                     audio_b64 = data.get("audio") or ""
                     if not audio_b64:
                         continue
+                    
+                    # Обновляем время последней активности сессии
+                    session.last_activity = time.time()
                     
                     # Периодическая очистка GPU памяти (каждые 500 сообщений на сессию)
                     message_counter += 1
