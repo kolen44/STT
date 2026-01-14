@@ -1,12 +1,11 @@
 """
-WebSocket STT сервер v2.4 - ИСПРАВЛЕН фильтр галлюцинаций
+WebSocket STT сервер v2.6 - Wake word "Optimus"
 OpenAI Whisper Medium на GPU + Picovoice Porcupine Wake Word
 
-Улучшения v2.4:
-- ИСПРАВЛЕНО: одиночное "Kiko" больше не фильтруется как галлюцинация
-- ИСПРАВЛЕНО: ошибка websocket при shutdown (ConnectionClosedOK)
-- Убраны паттерны r'^kiko\.?$' и r'^kiko,?\.?$' из HALLUCINATION_PATTERNS
-- Добавлена защита от ConnectionClosed при отправке сообщений
+Улучшения v2.6:
+- Замена wake word "Kiko" на "Optimus" во всём коде
+- Обновлены CORRECTION_DICT, PHONETIC_VARIANTS, HOTWORDS
+- Обновлены функции fuzzy_match, check_first_word, clean_duplicate
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -146,37 +145,26 @@ class VADConfig:
 
 
 # === Hotwords для boosting ===
-HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко", "Кико"]
+HOTWORDS = ["Optimus", "optimus", "OPTIMUS", "оптимус", "Оптимус"]
 
 # Количество preroll фреймов - МАКСИМУМ для захвата начала слов
 PREROLL_FRAMES = 30  # 30 фреймов = 600мс preroll для идеального захвата начала
 
 # Словарь для post-correction - РАСШИРЕННЫЙ v2.2
-# Включает все фонетические варианты Kiko и частые ошибки Whisper
+# Включает все фонетические варианты Optimus и частые ошибки Whisper
 CORRECTION_DICT = {
-    # Прямые фонетические варианты Kiko (включая Kika!)
-    "kiko": "Kiko", "kika": "Kiko", "kyko": "Kiko", "keeko": "Kiko", "kico": "Kiko",
-    "kieko": "Kiko", "keyko": "Kiko", "kikko": "Kiko", "keko": "Kiko",
-    "keeco": "Kiko", "kigo": "Kiko", "kiku": "Kiko", "kikou": "Kiko",
-    "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko", "kika's": "Kiko",
-    "keekou": "Kiko", "kikov": "Kiko", "kikka": "Kiko", "kica": "Kiko",
-    "keeko's": "Kiko", "keeku": "Kiko", "kikou's": "Kiko", "kiko!": "Kiko",
-    # Новые варианты - частые ошибки Whisper
-    "kiku": "Kiko", "keiku": "Kiko", "kiiko": "Kiko", "kicou": "Kiko",
-    "kykou": "Kiko", "keico": "Kiko", "kicu": "Kiko", "keeko,": "Kiko",
-    "kicko": "Kiko", "kekko": "Kiko", "kikoh": "Kiko", "keekoh": "Kiko",
-    # Двухсловные варианты с kiko/kika
-    "hey kiko": "Kiko", "hey kika": "Kiko", "ok kiko": "Kiko", "ok kika": "Kiko",
-    "okay kiko": "Kiko", "okay kika": "Kiko", "hi kiko": "Kiko", "hi kika": "Kiko",
-    "oh kiko": "Kiko", "oh kika": "Kiko", "yo kiko": "Kiko", "hey keeko": "Kiko",
-    "hey kyko": "Kiko", "ok keeko": "Kiko", "hi keeko": "Kiko",
+    # Прямые фонетические варианты Optimus
+    "optimus": "Optimus", "optimas": "Optimus", "optimis": "Optimus", "optimes": "Optimus",
+    "optimus'": "Optimus", "optimus's": "Optimus", "optimous": "Optimus", "optimis": "Optimus",
+    "optimus,": "Optimus,", "optimus.": "Optimus.", "optimus?": "Optimus?", "optimus!": "Optimus!",
+    "optimuss": "Optimus", "optimuz": "Optimus", "optimuse": "Optimus", "optimust": "Optimus",
+    "optumus": "Optimus", "optames": "Optimus", "optemos": "Optimus", "optimis": "Optimus",
+    # Двухсловные варианты
+    "hey optimus": "Optimus", "ok optimus": "Optimus", "okay optimus": "Optimus",
+    "hi optimus": "Optimus", "oh optimus": "Optimus", "yo optimus": "Optimus",
     # Русские варианты
-    "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko",
-    "кику": "Kiko", "кіку": "Kiko", "кико.": "Kiko", "кико,": "Kiko",
-    "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko", "кэко": "Kiko",
-    "кікко": "Kiko", "кикко": "Kiko", "кекко": "Kiko", "кiко": "Kiko",
-    # Частые фразы
-    "kiko,": "Kiko,", "kiko.": "Kiko.", "kiko?": "Kiko?", "kiko!": "Kiko!",
+    "оптимус": "Optimus", "оптімус": "Optimus", "оптимас": "Optimus", "оптимос": "Optimus",
+    "оптимус.": "Optimus", "оптимус,": "Optimus", "оптімус.": "Optimus",
 }
 
 # Паттерны для определения типа фразы
@@ -353,8 +341,8 @@ def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
         return VADConfig.MIN_PAUSE_MS
     
     # 2. Команды с wake word - быстрая реакция
-    has_kiko = any(w in text_lower for w in ['kiko', 'кико'])
-    if has_kiko and word_count <= 5:
+    has_optimus = any(w in text_lower for w in ['optimus', 'оптимус'])
+    if has_optimus and word_count <= 5:
         return VADConfig.MIN_PAUSE_MS
     
     # 3. Явно завершённые предложения (точка, !, ?)
@@ -404,24 +392,22 @@ def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
         return VADConfig.MAX_PAUSE_MS
 
 
-# Фонетические варианты Kiko - ТОЛЬКО явные варианты, без обычных слов
-KIKO_PHONETIC_VARIANTS = [
-    # Основные варианты - звучат как "kiko" или "kika"
-    "kiko", "kika", "kyko", "keeko", "kico", "kieko", "keyko",
-    "kikko", "kikka", "keko", "kiku", "keeco", "kigo", "kikou",
-    "kicco", "kica", "kyco", "keekou", "kikov",
+# Фонетические варианты Optimus - ТОЛЬКО явные варианты, без обычных слов
+OPTIMUS_PHONETIC_VARIANTS = [
+    # Основные варианты - звучат как "optimus"
+    "optimus", "optimas", "optimis", "optimes", "optimous", "optimuz",
+    "optumus", "optemos", "optimuss", "optimuse", "optimust",
     # Русские варианты
-    "кико", "кіко", "кика", "кеко", "кику", "кіку",
-    "киго", "кійко", "кийко", "кэко", "кікко", "кикко",
+    "оптимус", "оптімус", "оптимас", "оптимос", "оптімас",
 ]
 
 
-def fuzzy_match_kiko(word: str) -> bool:
-    """Проверяет, похоже ли слово на 'Kiko' - СТРОГАЯ версия"""
+def fuzzy_match_optimus(word: str) -> bool:
+    """Проверяет, похоже ли слово на 'Optimus' - СТРОГАЯ версия"""
     clean = re.sub(r'[^\w]', '', word).lower()
     
     # Пустое слово или слишком короткое/длинное
-    if not clean or len(clean) < 3 or len(clean) > 6:
+    if not clean or len(clean) < 6 or len(clean) > 10:
         return False
     
     # Прямое совпадение в словаре
@@ -429,15 +415,15 @@ def fuzzy_match_kiko(word: str) -> bool:
         return True
     
     # Фонетические варианты (строгий список)
-    if clean in KIKO_PHONETIC_VARIANTS:
+    if clean in OPTIMUS_PHONETIC_VARIANTS:
         return True
     
-    # Строгий паттерн: только k + i/y + k/c + o
-    if re.match(r'^k[iy]k?[ckg]?o$', clean):
+    # Строгий паттерн: opt + im/em/am + us/is/os
+    if re.match(r'^opt[iea]m[uio]s+[est]?$', clean):
         return True
     
-    # Русский паттерн: к + и/і + к + о
-    if re.match(r'^к[иіе]к?[кг]?о$', clean):
+    # Русский паттерн: опт + им/ім + ус/ас
+    if re.match(r'^опт[иіе]м[уао]с$', clean):
         return True
     
     return False
@@ -446,7 +432,7 @@ def fuzzy_match_kiko(word: str) -> bool:
 def apply_post_correction(text: str) -> str:
     """
     Применяем пост-коррекцию текста - СТРОГАЯ версия.
-    Заменяем только явные варианты Kiko, не трогаем обычные слова.
+    Заменяем только явные варианты Optimus, не трогаем обычные слова.
     """
     if not text:
         return text
@@ -464,9 +450,9 @@ def apply_post_correction(text: str) -> str:
         # ТОЛЬКО прямое совпадение в словаре - никакого fuzzy matching!
         if clean_word in CORRECTION_DICT:
             corrected = CORRECTION_DICT[clean_word]
-        # Строгий fuzzy match только для явных вариантов Kiko
-        elif fuzzy_match_kiko(clean_word):
-            corrected = "Kiko"
+        # Строгий fuzzy match только для явных вариантов Optimus
+        elif fuzzy_match_optimus(clean_word):
+            corrected = "Optimus"
         
         if corrected:
             final_word = punctuation_before + corrected + punctuation_after
@@ -476,16 +462,16 @@ def apply_post_correction(text: str) -> str:
     
     result = ' '.join(corrected_words)
     
-    # Убираем дубликаты Kiko рядом: "Kiko Kiko включи" -> "Kiko, включи"
-    result = re.sub(r'\bKiko\s+Kiko\b', 'Kiko,', result, flags=re.IGNORECASE)
+    # Убираем дубликаты Optimus рядом: "Optimus Optimus включи" -> "Optimus, включи"
+    result = re.sub(r'\bOptimus\s+Optimus\b', 'Optimus,', result, flags=re.IGNORECASE)
     
     return result
 
 
-def check_first_word_is_kiko(text: str) -> str:
+def check_first_word_is_optimus(text: str) -> str:
     """
-    Проверяет первое слово на похожесть с Kiko и исправляет если нужно.
-    СТРОГАЯ версия - только явные варианты Kiko, не трогаем обычные слова.
+    Проверяет первое слово на похожесть с Optimus и исправляет если нужно.
+    СТРОГАЯ версия - только явные варианты Optimus, не трогаем обычные слова.
     """
     if not text or len(text) < 2:
         return text
@@ -496,36 +482,31 @@ def check_first_word_is_kiko(text: str) -> str:
     
     first_word = words[0].lower().strip('.,!?')
     
-    # РАСШИРЕННЫЙ список фонетических вариантов Kiko v2.2
-    kiko_like_starts = [
-        # Прямые варианты звучащие как "kiko" или "kika"
-        "kiko", "kika", "keko", "kico", "kica", "kyko", "keeko", "kiku",
-        "kikko", "kikka", "kicco", "keyko", "kieko", "kikou", "kicko",
-        "kekko", "kikoh", "keekoh", "kykou", "keico", "kicu", "kiiko",
-        "keiku", "kicou", "kyco",
+    # РАСШИРЕННЫЙ список фонетических вариантов Optimus
+    optimus_like_starts = [
+        # Прямые варианты звучащие как "optimus"
+        "optimus", "optimas", "optimis", "optimes", "optimous", "optimuz",
+        "optumus", "optemos", "optimuss", "optimuse", "optimust",
         # Русские варианты
-        "кико", "кіко", "кика", "кеко", "кику", "кико,", "кико.",
-        "кикко", "кекко", "киго", "кійко", "кийко", "кэко", "кiко",
+        "оптимус", "оптімус", "оптимас", "оптимос", "оптимус,", "оптимус.",
     ]
     
     # Проверяем первое слово
-    if first_word in kiko_like_starts:
-        words[0] = "Kiko"
+    if first_word in optimus_like_starts:
+        words[0] = "Optimus"
         return ' '.join(words)
     
-    # Проверяем ТОЛЬКО явные двухсловные комбинации с kiko/kika
+    # Проверяем ТОЛЬКО явные двухсловные комбинации с optimus
     if len(words) >= 2:
         two_words = f"{words[0]} {words[1]}".lower()
-        kiko_like_two_words = [
-            "hey kiko", "hey kika", "hey kyko", "hey keeko", "hey kikko",
-            "ok kiko", "ok kika", "ok keeko", "okay kiko", "okay kika", "okay keeko",
-            "hi kiko", "hi kika", "hi kyko", "hi keeko", "oh kiko", "oh kika",
-            "yo kiko", "yo kika", "yo keeko",
-            "эй кико", "хей кико", "о кико", "эй кика", "хей кика", "привет кико",
+        optimus_like_two_words = [
+            "hey optimus", "ok optimus", "okay optimus",
+            "hi optimus", "oh optimus", "yo optimus",
+            "эй оптимус", "хей оптимус", "о оптимус", "привет оптимус",
         ]
-        if two_words in kiko_like_two_words:
-            # Заменяем первые два слова на Kiko
-            return "Kiko " + ' '.join(words[2:]) if len(words) > 2 else "Kiko"
+        if two_words in optimus_like_two_words:
+            # Заменяем первые два слова на Optimus
+            return "Optimus " + ' '.join(words[2:]) if len(words) > 2 else "Optimus"
     
     return text
 
@@ -555,13 +536,13 @@ def get_speaker_hash(audio_data: np.ndarray) -> str:
 
 # Паттерны галлюцинаций Whisper (текст из промпта или повторения)
 HALLUCINATION_PATTERNS = [
-    r'^kiko[\s,\.]*kiko[\s,\.]*kiko',  # Повторяющееся Kiko 3+ раз
-    r'^(kiko[\s,\.]*){4,}',  # Kiko 4+ раз подряд (увеличено с 3)
-    r'^кико[\s,\.]*кико[\s,\.]*кико',  # То же на русском
+    r'^optimus[\s,\.]*optimus[\s,\.]*optimus',  # Повторяющееся Optimus 3+ раз
+    r'^(optimus[\s,\.]*){4,}',  # Optimus 4+ раз подряд
+    r'^оптимус[\s,\.]*оптимус[\s,\.]*оптимус',  # То же на русском
     r'voice assistant',  # ГЛАВНЫЙ источник галлюцинаций!
-    r'kiko assistant',   # Частая галлюцинация
-    r'kiko is a',        # Галлюцинация из промпта
-    r'assistant kiko',   # Ещё вариант
+    r'optimus assistant',   # Частая галлюцинация
+    r'optimus is a',        # Галлюцинация из промпта
+    r'assistant optimus',   # Ещё вариант
     r'common phrases',   # Из промпта  
     r'having a conversation',  # Из промпта
     r'^\s*\.+\s*$',     # Только точки
@@ -571,9 +552,8 @@ HALLUCINATION_PATTERNS = [
     r'subscribe',
     r'like and subscribe',
     r'please subscribe',
-    # УБРАНО: r'^kiko\.?$' - это валидный wake word!
-    # УБРАНО: r'^kiko,?\.?$' - это валидный wake word!
-    r'\bthe\s+kiko\b',  # "the Kiko" - неестественно
+    # УБРАНО: r'^optimus\.?$' - это валидный wake word!
+    r'\bthe\s+optimus\b',  # "the Optimus" - неестественно
 ]
 
 def is_noise_or_garbage(text: str) -> bool:
@@ -615,7 +595,7 @@ def is_hallucination(text: str) -> bool:
         if re.search(pattern, t, re.IGNORECASE):
             return True
     
-    # Проверка на повторяющиеся слова ("kiko kiko kiko" или "the the the")
+    # Проверка на повторяющиеся слова ("optimus optimus optimus" или "the the the")
     words = t.split()
     if len(words) >= 3:
         # Если одно слово повторяется 3+ раза подряд
@@ -623,31 +603,31 @@ def is_hallucination(text: str) -> bool:
             if words[i] == words[i+1] == words[i+2]:
                 return True
     
-    # УБРАНО: одиночное "Kiko" - это валидный wake word!
-    # Теперь НЕ фильтруем одиночное Kiko - это нормальная активация ассистента
-    # non_kiko_words = [w for w in words if w.lower() != 'kiko']
-    # if len(words) > 0 and len(non_kiko_words) == 0:
+    # УБРАНО: одиночное "Optimus" - это валидный wake word!
+    # Теперь НЕ фильтруем одиночное Optimus - это нормальная активация ассистента
+    # non_optimus_words = [w for w in words if w.lower() != 'optimus']
+    # if len(words) > 0 and len(non_optimus_words) == 0:
     #     return True
     
     return False
 
 
-def clean_duplicate_kiko(text: str) -> str:
-    """Удаляет повторяющиеся 'kiko', оставляя только первый.
-    Также убирает пунктуацию рядом с удалёнными kiko.
+def clean_duplicate_optimus(text: str) -> str:
+    """Удаляет повторяющиеся 'optimus', оставляя только первый.
+    Также убирает пунктуацию рядом с удалёнными optimus.
     """
     if not text:
         return text
     
-    # Считаем сколько kiko в тексте (включая с пунктуацией рядом)
-    kiko_matches = list(re.finditer(r'\bkiko\b', text, re.IGNORECASE))
-    if len(kiko_matches) <= 1:
+    # Считаем сколько optimus в тексте (включая с пунктуацией рядом)
+    optimus_matches = list(re.finditer(r'\boptimus\b', text, re.IGNORECASE))
+    if len(optimus_matches) <= 1:
         return text
     
-    # Удаляем все kiko кроме первого, вместе с окружающей пунктуацией
+    # Удаляем все optimus кроме первого, вместе с окружающей пунктуацией
     result = text
     # Идём с конца чтобы индексы не сбивались
-    for match in reversed(kiko_matches[1:]):
+    for match in reversed(optimus_matches[1:]):
         start, end = match.start(), match.end()
         
         # Расширяем диапазон удаления на пунктуацию и пробелы вокруг
@@ -741,11 +721,11 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     # Финальная проверка типа - ОБЯЗАТЕЛЬНО float32 для Whisper!
     audio = audio.astype(np.float32)
     
-    # Контекст - БЕЗ Kiko в промпте (вызывало галлюцинации)
+    # Контекст - БЕЗ Optimus в промпте (вызывало галлюцинации)
     context_prompt = None
     if len(session.conversation_context) >= 2:
         recent = session.conversation_context[-2:]
-        clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '').replace('Kiko', '').replace('kiko', '')
+        clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '').replace('Optimus', '').replace('optimus', '')
         if clean_context.strip() and len(clean_context) < 150:
             context_prompt = clean_context.strip()
     
@@ -829,17 +809,17 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     text = result.get("text", "").strip() if isinstance(result, dict) else ""
     text = apply_post_correction(text)
     
-    # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если первое слово похоже на Kiko - исправляем
+    # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если первое слово похоже на Optimus - исправляем
     original_first_word = text
-    text = check_first_word_is_kiko(text)
+    text = check_first_word_is_optimus(text)
     if text != original_first_word and not is_partial:
-        print(f"🔧 [{session.client_id}] Fixed first word to Kiko: {original_first_word!r} -> {text!r}")
+        print(f"🔧 [{session.client_id}] Fixed first word to Optimus: {original_first_word!r} -> {text!r}")
     
-    # Очищаем дублирующиеся "kiko" (оставляем только первый)
+    # Очищаем дублирующиеся "optimus" (оставляем только первый)
     original_text = text
-    text = clean_duplicate_kiko(text)
+    text = clean_duplicate_optimus(text)
     if text != original_text and not is_partial:
-        print(f"🔧 [{session.client_id}] Cleaned duplicate kiko: {original_text!r} -> {text!r}")
+        print(f"🔧 [{session.client_id}] Cleaned duplicate optimus: {original_text!r} -> {text!r}")
     
     end_time = time.perf_counter()
     transcription_time = (end_time - start_time) * 1000
@@ -878,7 +858,7 @@ async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket
             if session.speech_frames >= VADConfig.SPEECH_START_FRAMES:
                 session.state = SpeechState.SPEECH
                 session.speech_start_time = current_time
-                # УВЕЛИЧЕННЫЙ Preroll для захвата начала фразы с Kiko
+                # УВЕЛИЧЕННЫЙ Preroll для захвата начала фразы с Optimus
                 session.speech_buffer = list(session.audio_buffer[-PREROLL_FRAMES:])
                 print(f"🎤 [{session.client_id}] Speech started (preroll: {len(session.speech_buffer)} frames)")
         
