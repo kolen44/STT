@@ -61,8 +61,11 @@ print("=" * 80)
 print()
 
 # ThreadPoolExecutor для блокирующих операций (Whisper)
-# Используем 2 воркера чтобы не перегружать GPU
-whisper_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="whisper_")
+# Используем 1 воркер - модель НЕ thread-safe!
+whisper_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper_")
+
+# Lock для сериализации доступа к Whisper модели (CUDA не thread-safe)
+whisper_lock = threading.Lock()
 
 # Таймаут для транскрибации (секунды)
 TRANSCRIBE_TIMEOUT = 30.0
@@ -236,18 +239,26 @@ class ClientSession:
 sessions: Dict[str, ClientSession] = {}
 sessions_lock = asyncio.Lock()  # asyncio Lock вместо threading Lock для async контекста
 
+# Максимальное количество одновременных сессий (защита от перегрузки)
+MAX_CONCURRENT_SESSIONS = 20
 
-async def cleanup_gpu_memory():
+
+async def cleanup_gpu_memory(force: bool = False):
     """Периодическая очистка GPU памяти для предотвращения утечек"""
     global last_gpu_cleanup
     current_time = time.time()
-    if current_time - last_gpu_cleanup > GPU_CLEANUP_INTERVAL:
+    
+    # Принудительная очистка или по таймеру
+    if force or current_time - last_gpu_cleanup > GPU_CLEANUP_INTERVAL:
         try:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 gc.collect()
             last_gpu_cleanup = current_time
+            async with sessions_lock:
+                active_count = len(sessions)
             print(f"🧹 GPU memory cleanup performed")
+            print(f"📊 Активных сессий: {active_count}")
         except Exception as e:
             print(f"⚠️ GPU cleanup error: {e}")
 
@@ -665,40 +676,54 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     start_time = time.perf_counter()
     
     # Синхронная функция для выполнения в executor - ВЫСОКОЕ КАЧЕСТВО
+    # ВАЖНО: используем lock для сериализации доступа к GPU модели
     def _transcribe_sync():
         # Защита от слишком короткого аудио (< 0.8 сек) - предотвращает sequence error
         if len(audio) < SAMPLE_RATE * 0.8:
             return {"text": "", "segments": []}
         
-        return whisper_model.transcribe(
-            audio,
-            language="en",  # Фиксированный язык для стабильности
-            task="transcribe",
-            initial_prompt=context_prompt,
-            fp16=True,
-            
-            # Beam search для качества
-            beam_size=WhisperConfig.BEAM_SIZE,
-            best_of=WhisperConfig.BEST_OF,
-            
-            # Temperature - низкая для стабильности
-            temperature=WhisperConfig.TEMPERATURE,
-            
-            # Фильтры качества
-            compression_ratio_threshold=WhisperConfig.COMPRESSION_RATIO_THRESHOLD,
-            logprob_threshold=WhisperConfig.LOGPROB_THRESHOLD,
-            no_speech_threshold=WhisperConfig.NO_SPEECH_THRESHOLD,
-            
-            # Независимые сегменты
-            condition_on_previous_text=WhisperConfig.CONDITION_ON_PREVIOUS,
-            
-            # Word timestamps для точности
-            word_timestamps=WhisperConfig.WORD_TIMESTAMPS,
-            
-            # Пунктуация
-            prepend_punctuations=WhisperConfig.PREPEND_PUNCTUATIONS,
-            append_punctuations=WhisperConfig.APPEND_PUNCTUATIONS,
-        )
+        # Lock для предотвращения конкурентного доступа к модели
+        # Это решает ошибки "Key and Value must have the same sequence length"
+        with whisper_lock:
+            try:
+                return whisper_model.transcribe(
+                    audio,
+                    language="en",  # Фиксированный язык для стабильности
+                    task="transcribe",
+                    initial_prompt=context_prompt,
+                    fp16=True,
+                    
+                    # Beam search для качества
+                    beam_size=WhisperConfig.BEAM_SIZE,
+                    best_of=WhisperConfig.BEST_OF,
+                    
+                    # Temperature - низкая для стабильности
+                    temperature=WhisperConfig.TEMPERATURE,
+                    
+                    # Фильтры качества
+                    compression_ratio_threshold=WhisperConfig.COMPRESSION_RATIO_THRESHOLD,
+                    logprob_threshold=WhisperConfig.LOGPROB_THRESHOLD,
+                    no_speech_threshold=WhisperConfig.NO_SPEECH_THRESHOLD,
+                    
+                    # Независимые сегменты
+                    condition_on_previous_text=WhisperConfig.CONDITION_ON_PREVIOUS,
+                    
+                    # Word timestamps для точности
+                    word_timestamps=WhisperConfig.WORD_TIMESTAMPS,
+                    
+                    # Пунктуация
+                    prepend_punctuations=WhisperConfig.PREPEND_PUNCTUATIONS,
+                    append_punctuations=WhisperConfig.APPEND_PUNCTUATIONS,
+                )
+            except RuntimeError as e:
+                # Ловим CUDA/PyTorch ошибки и возвращаем пустой результат
+                error_msg = str(e)
+                if "sequence length" in error_msg or "size" in error_msg or "shape" in error_msg:
+                    print(f"⚠️ [{session.client_id}] CUDA tensor error (recovering): {error_msg[:80]}")
+                    # Очищаем GPU кэш при ошибке
+                    torch.cuda.empty_cache()
+                    return {"text": "", "segments": []}
+                raise  # Пробрасываем другие ошибки
     
     try:
         # Выполняем блокирующую транскрибацию в отдельном потоке с таймаутом
@@ -718,7 +743,14 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
                    "audio_duration_s": round(audio_duration, 3),
                    "error": str(e)}
     
-    text = result["text"].strip()
+    # Защита от None результата (может случиться при CUDA ошибках)
+    if result is None:
+        print(f"⚠️ [{session.client_id}] Transcription returned None")
+        return "", {"transcription_time_ms": 0, 
+                   "audio_duration_s": round(audio_duration, 3),
+                   "error": "null_result"}
+    
+    text = result.get("text", "").strip() if isinstance(result, dict) else ""
     text = apply_post_correction(text)
     
     # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если первое слово похоже на Kiko - исправляем
@@ -956,6 +988,19 @@ async def handle_client(websocket):
     """Обработка подключения клиента"""
     client_id = str(id(websocket))
     
+    # Проверка лимита сессий для защиты от перегрузки GPU
+    async with sessions_lock:
+        current_count = len(sessions)
+        if current_count >= MAX_CONCURRENT_SESSIONS:
+            print(f"⚠️ [{client_id}] Rejected: too many sessions ({current_count}/{MAX_CONCURRENT_SESSIONS})")
+            await websocket.send(json.dumps({
+                "type": "error",
+                "message": f"Server overloaded. Max {MAX_CONCURRENT_SESSIONS} concurrent sessions.",
+                "code": "max_sessions_reached"
+            }))
+            await websocket.close()
+            return
+    
     # Создаём чистую сессию (защита от проблем при перезагрузке)
     session = ClientSession(client_id=client_id)
     async with sessions_lock:
@@ -1002,10 +1047,10 @@ async def handle_client(websocket):
                     if not audio_b64:
                         continue
                     
-                    # Периодическая очистка GPU памяти (каждые 1000 сообщений)
+                    # Периодическая очистка GPU памяти (каждые 500 сообщений на сессию)
                     message_counter += 1
-                    if message_counter % 1000 == 0:
-                        await cleanup_gpu_memory()
+                    if message_counter % 500 == 0:
+                        await cleanup_gpu_memory(force=True)
                     
                     try:
                         audio_chunk = np.frombuffer(
