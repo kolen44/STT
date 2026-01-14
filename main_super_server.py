@@ -1,16 +1,15 @@
 """
-WebSocket STT сервер v2.2 - МАКСИМАЛЬНОЕ КАЧЕСТВО распознавания
+WebSocket STT сервер v2.3 - ИСПРАВЛЕН dtype error
 OpenAI Whisper Medium на GPU + Picovoice Porcupine Wake Word
 
-Улучшения v2.2:
-- Beam search 7 вместо 5 для лучшего качества коротких фраз
-- Снижены пороги energy для захвата тихой речи
+Улучшения v2.3:
+- ИСПРАВЛЕНО: float vs double dtype error при предобработке аудио
+- Явное приведение к float32 на всех этапах обработки
+- Beam search 7 для лучшего качества коротких фраз
 - Улучшенная предобработка аудио (DC offset, high-pass filter, RMS нормализация)
 - Расширенный словарь коррекции Kiko (60+ вариантов)
 - Быстрые паузы (650-1500мс) для отзывчивости
 - Preroll 600мс для захвата начала слов
-- Initial prompt "Kiko" для boosting wake word
-- Picovoice Porcupine интеграция для wake word detection
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -707,15 +706,18 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
         return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3), 
                    "realtime_factor": 0, "samples": len(audio), "skipped": "low_energy"}
     
-    # === УЛУЧШЕННАЯ ПРЕДОБРАБОТКА АУДИО v2.2 ===
+    # === УЛУЧШЕННАЯ ПРЕДОБРАБОТКА АУДИО v2.3 ===
+    
+    # ВАЖНО: Whisper требует float32, убеждаемся в правильном типе
+    audio = audio.astype(np.float32)
     
     # 1. Убираем DC offset (постоянную составляющую)
-    audio = audio - np.mean(audio)
+    audio = audio - np.mean(audio, dtype=np.float32)
     
     # 2. Мягкий high-pass фильтр для удаления низкочастотного гула (< 80 Hz)
     # Простой single-pole filter: y[n] = x[n] - x[n-1] + 0.97 * y[n-1]
-    alpha = 0.97
-    filtered = np.zeros_like(audio)
+    alpha = np.float32(0.97)
+    filtered = np.zeros_like(audio, dtype=np.float32)
     for i in range(1, len(audio)):
         filtered[i] = audio[i] - audio[i-1] + alpha * filtered[i-1]
     audio = filtered
@@ -726,16 +728,19 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     
     if max_val > 0.01:
         # Нормализуем по пику, но учитываем RMS для контроля динамики
-        target_rms = 0.15  # Целевой RMS уровень
+        target_rms = np.float32(0.15)  # Целевой RMS уровень
         if rms > 0.001:
             # Ограничиваем усиление чтобы не поднять шум
-            gain = min(target_rms / rms, 0.95 / max_val, 3.0)
+            gain = np.float32(min(target_rms / rms, 0.95 / max_val, 3.0))
             audio = audio * gain
         else:
-            audio = audio / max_val * 0.95
+            audio = audio / max_val * np.float32(0.95)
     
     # 4. Мягкое ограничение пиков (soft clipping) для предотвращения клиппинга
-    audio = np.tanh(audio * 1.2) / np.tanh(1.2)  # Soft saturation
+    audio = np.tanh(audio * np.float32(1.2)) / np.float32(np.tanh(1.2))
+    
+    # Финальная проверка типа - ОБЯЗАТЕЛЬНО float32 для Whisper!
+    audio = audio.astype(np.float32)
     
     # Контекст - оптимизированный prompt для Kiko
     context_prompt = "Kiko"  # Базовый prompt для boosting wake word
