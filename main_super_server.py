@@ -1,13 +1,16 @@
 """
-WebSocket STT сервер v2.0 - ChatGPT-style диалоговый режим
-OpenAI Whisper Small на GPU
+WebSocket STT сервер v2.2 - МАКСИМАЛЬНОЕ КАЧЕСТВО распознавания
+OpenAI Whisper Medium на GPU + Picovoice Porcupine Wake Word
 
-Основные улучшения:
-- Интеллектуальное определение пауз (адаптивное 0.5-1.5 сек вместо 6 сек)
-- Streaming partial results во время речи
-- Proper sentence boundary detection
-- Корректная обработка множественных "Kiko"
-- Real-time feedback как в ChatGPT
+Улучшения v2.2:
+- Beam search 7 вместо 5 для лучшего качества коротких фраз
+- Снижены пороги energy для захвата тихой речи
+- Улучшенная предобработка аудио (DC offset, high-pass filter, RMS нормализация)
+- Расширенный словарь коррекции Kiko (60+ вариантов)
+- Быстрые паузы (650-1500мс) для отзывчивости
+- Preroll 600мс для захвата начала слов
+- Initial prompt "Kiko" для boosting wake word
+- Picovoice Porcupine интеграция для wake word detection
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -80,51 +83,51 @@ last_gpu_cleanup = time.time()
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # int16
 
-# === WHISPER ADVANCED SETTINGS - ОПТИМИЗИРОВАНО ДЛЯ КАЧЕСТВА ===
+# === WHISPER ADVANCED SETTINGS - МАКСИМАЛЬНОЕ КАЧЕСТВО v2.2 ===
 class WhisperConfig:
-    # Beam search для лучшего качества
-    BEAM_SIZE = 5      # 5 beams - баланс качества/скорости
-    BEST_OF = 5        # Выбор лучшего из 5 кандидатов
+    # Beam search - УВЕЛИЧЕНО для лучшего качества
+    BEAM_SIZE = 7      # 7 beams - выше качество для коротких фраз
+    BEST_OF = 7        # Выбор лучшего из 7 кандидатов
     
-    # Temperature - НИЗКАЯ для стабильности, fallback при неуверенности
-    TEMPERATURE = (0.0, 0.2, 0.4, 0.6, 0.8)  # Больше fallback вариантов
+    # Temperature - НИЗКАЯ для стабильности, агрессивный fallback
+    TEMPERATURE = (0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0)  # Больше шагов для fallback
     
-    # Compression ratio - фильтр галлюцинаций (чуть мягче)
-    COMPRESSION_RATIO_THRESHOLD = 2.6
+    # Compression ratio - МЯГЧЕ для сохранения коротких фраз
+    COMPRESSION_RATIO_THRESHOLD = 2.8
     
-    # Log probability - МЯГЧЕ для лучшего распознавания
-    LOGPROB_THRESHOLD = -1.2  # Мягче - не отбрасывает неуверенные слова
+    # Log probability - ЕЩЁ МЯГЧЕ для улучшения распознавания
+    LOGPROB_THRESHOLD = -1.5  # Мягче - принимаем менее уверенные слова
     
-    # No speech threshold - баланс
-    NO_SPEECH_THRESHOLD = 0.6  # Стандартное значение Whisper
+    # No speech threshold - МЯГЧЕ для тихой речи
+    NO_SPEECH_THRESHOLD = 0.55  # Ниже - меньше пропусков тихой речи
     
     # Condition on previous - отключено для независимости
     CONDITION_ON_PREVIOUS = False
     
-    # Word timestamps - ВКЛЮЧЕНО для точности
-    WORD_TIMESTAMPS = True  # Улучшает точность распознавания
+    # Word timestamps - ВКЛЮЧЕНО для точности и word-level confidence
+    WORD_TIMESTAMPS = True  # Улучшает точность + даёт уверенность по словам
     
-    # Punctuations
-    PREPEND_PUNCTUATIONS = "\"'¿([{-"
-    APPEND_PUNCTUATIONS = "\"'.;googlelr);:?!،、。」』】〗》）\n"
+    # Punctuations - расширенный набор
+    PREPEND_PUNCTUATIONS = "\"'¿([{-«"
+    APPEND_PUNCTUATIONS = "\"'.;:?!,،、。」』】〗》）»\n"
 
 
-# === VAD настройки - ОПТИМИЗИРОВАНО ДЛЯ КАЧЕСТВА ===
+# === VAD настройки - МАКСИМАЛЬНАЯ ЧУВСТВИТЕЛЬНОСТЬ v2.2 ===
 class VADConfig:
-    # Порог энергии для определения речи - ОЧЕНЬ МЯГКИЙ для RTSP
-    ENERGY_THRESHOLD = 0.003  # Ниже для захвата тихих слов
+    # Порог энергии для определения речи - ULTRA МЯГКИЙ
+    ENERGY_THRESHOLD = 0.002  # Очень низкий для захвата шёпота
     
-    # Минимальная энергия для транскрибации - ОЧЕНЬ МЯГКИЙ
-    MIN_AUDIO_ENERGY = 0.004  # Низкий порог для RTSP микрофона
+    # Минимальная энергия для транскрибации - ULTRA МЯГКИЙ
+    MIN_AUDIO_ENERGY = 0.003  # Очень низкий для тихого микрофона
     
-    # Адаптивные паузы - баланс скорости и точности
-    MIN_PAUSE_MS = 800        # 800мс минимум
-    DEFAULT_PAUSE_MS = 1200   # 1200мс стандарт
-    MAX_PAUSE_MS = 1800       # 1800мс макс для длинных предложений
-    QUESTION_PAUSE_MS = 900   # 900мс для вопросов
+    # Адаптивные паузы - БЫСТРЕЕ для отзывчивости
+    MIN_PAUSE_MS = 650        # 650мс минимум - быстрее реакция
+    DEFAULT_PAUSE_MS = 1000   # 1000мс стандарт - быстрее
+    MAX_PAUSE_MS = 1500       # 1500мс макс для длинных предложений
+    QUESTION_PAUSE_MS = 750   # 750мс для вопросов - быстрее
     
-    # Минимальная длительность речи - УВЕЛИЧЕНА для стабильности Whisper
-    MIN_SPEECH_MS = 600       # 600мс - минимум для избежания sequence error
+    # Минимальная длительность речи - оптимальная для Whisper
+    MIN_SPEECH_MS = 500       # 500мс - минимум для коротких слов
     
     # Максимальная длительность сегмента
     MAX_SEGMENT_MS = 30000    # 30 секунд
@@ -148,11 +151,11 @@ class VADConfig:
 # === Hotwords для boosting ===
 HOTWORDS = ["Kiko", "kiko", "KIKO", "кико", "кіко", "Кико"]
 
-# Количество preroll фреймов - УВЕЛИЧЕНО для захвата начала слов
-PREROLL_FRAMES = 25  # 25 фреймов = 500мс preroll для лучшего захвата начала
+# Количество preroll фреймов - МАКСИМУМ для захвата начала слов
+PREROLL_FRAMES = 30  # 30 фреймов = 600мс preroll для идеального захвата начала
 
-# Словарь для post-correction - ТОЛЬКО явные ошибки распознавания Kiko
-# НЕ включаем обычные английские слова!
+# Словарь для post-correction - РАСШИРЕННЫЙ v2.2
+# Включает все фонетические варианты Kiko и частые ошибки Whisper
 CORRECTION_DICT = {
     # Прямые фонетические варианты Kiko (включая Kika!)
     "kiko": "Kiko", "kika": "Kiko", "kyko": "Kiko", "keeko": "Kiko", "kico": "Kiko",
@@ -160,15 +163,23 @@ CORRECTION_DICT = {
     "keeco": "Kiko", "kigo": "Kiko", "kiku": "Kiko", "kikou": "Kiko",
     "kicco": "Kiko", "kyco": "Kiko", "kiko's": "Kiko", "kika's": "Kiko",
     "keekou": "Kiko", "kikov": "Kiko", "kikka": "Kiko", "kica": "Kiko",
-    # Только явные двухсловные варианты с kiko/kika
+    "keeko's": "Kiko", "keeku": "Kiko", "kikou's": "Kiko", "kiko!": "Kiko",
+    # Новые варианты - частые ошибки Whisper
+    "kiku": "Kiko", "keiku": "Kiko", "kiiko": "Kiko", "kicou": "Kiko",
+    "kykou": "Kiko", "keico": "Kiko", "kicu": "Kiko", "keeko,": "Kiko",
+    "kicko": "Kiko", "kekko": "Kiko", "kikoh": "Kiko", "keekoh": "Kiko",
+    # Двухсловные варианты с kiko/kika
     "hey kiko": "Kiko", "hey kika": "Kiko", "ok kiko": "Kiko", "ok kika": "Kiko",
     "okay kiko": "Kiko", "okay kika": "Kiko", "hi kiko": "Kiko", "hi kika": "Kiko",
-    "oh kiko": "Kiko", "oh kika": "Kiko",
+    "oh kiko": "Kiko", "oh kika": "Kiko", "yo kiko": "Kiko", "hey keeko": "Kiko",
+    "hey kyko": "Kiko", "ok keeko": "Kiko", "hi keeko": "Kiko",
     # Русские варианты
     "кико": "Kiko", "кіко": "Kiko", "кика": "Kiko", "кеко": "Kiko",
     "кику": "Kiko", "кіку": "Kiko", "кико.": "Kiko", "кико,": "Kiko",
     "киго": "Kiko", "кійко": "Kiko", "кийко": "Kiko", "кэко": "Kiko",
-    "кікко": "Kiko", "кикко": "Kiko", "кекко": "Kiko",
+    "кікко": "Kiko", "кикко": "Kiko", "кекко": "Kiko", "кiко": "Kiko",
+    # Частые фразы
+    "kiko,": "Kiko,", "kiko.": "Kiko.", "kiko?": "Kiko?", "kiko!": "Kiko!",
 }
 
 # Паттерны для определения типа фразы
@@ -488,14 +499,16 @@ def check_first_word_is_kiko(text: str) -> str:
     
     first_word = words[0].lower().strip('.,!?')
     
-    # ТОЛЬКО явные фонетические варианты Kiko - НЕ обычные английские слова!
+    # РАСШИРЕННЫЙ список фонетических вариантов Kiko v2.2
     kiko_like_starts = [
         # Прямые варианты звучащие как "kiko" или "kika"
         "kiko", "kika", "keko", "kico", "kica", "kyko", "keeko", "kiku",
-        "kikko", "kikka", "kicco", "keyko", "kieko", "kikou",
+        "kikko", "kikka", "kicco", "keyko", "kieko", "kikou", "kicko",
+        "kekko", "kikoh", "keekoh", "kykou", "keico", "kicu", "kiiko",
+        "keiku", "kicou", "kyco",
         # Русские варианты
-        "кико", "кіко", "кика", "кеко", "кику",
-        "кикко", "кекко",
+        "кико", "кіко", "кика", "кеко", "кику", "кико,", "кико.",
+        "кикко", "кекко", "киго", "кійко", "кийко", "кэко", "кiко",
     ]
     
     # Проверяем первое слово
@@ -507,9 +520,11 @@ def check_first_word_is_kiko(text: str) -> str:
     if len(words) >= 2:
         two_words = f"{words[0]} {words[1]}".lower()
         kiko_like_two_words = [
-            "hey kiko", "hey kika", "hey kyko", "ok kiko", "ok kika", "okay kiko", "okay kika",
-            "hi kiko", "hi kika", "hi kyko", "oh kiko", "oh kika",
-            "эй кико", "хей кико", "о кико", "эй кика", "хей кика",
+            "hey kiko", "hey kika", "hey kyko", "hey keeko", "hey kikko",
+            "ok kiko", "ok kika", "ok keeko", "okay kiko", "okay kika", "okay keeko",
+            "hi kiko", "hi kika", "hi kyko", "hi keeko", "oh kiko", "oh kika",
+            "yo kiko", "yo kika", "yo keeko",
+            "эй кико", "хей кико", "о кико", "эй кика", "хей кика", "привет кико",
         ]
         if two_words in kiko_like_two_words:
             # Заменяем первые два слова на Kiko
@@ -692,27 +707,51 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
         return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3), 
                    "realtime_factor": 0, "samples": len(audio), "skipped": "low_energy"}
     
-    # УБРАН noise gate - он резал тихие звуки!
-    # Только лёгкая нормализация громкости (как у OpenAI)
-    max_val = np.max(np.abs(audio))
-    if max_val > 0.01:
-        audio = audio / max_val * 0.95  # Нормализация до 95%
+    # === УЛУЧШЕННАЯ ПРЕДОБРАБОТКА АУДИО v2.2 ===
     
-    # Контекст - только для длинных сессий
-    context_prompt = None
-    if len(session.conversation_context) >= 3:
+    # 1. Убираем DC offset (постоянную составляющую)
+    audio = audio - np.mean(audio)
+    
+    # 2. Мягкий high-pass фильтр для удаления низкочастотного гула (< 80 Hz)
+    # Простой single-pole filter: y[n] = x[n] - x[n-1] + 0.97 * y[n-1]
+    alpha = 0.97
+    filtered = np.zeros_like(audio)
+    for i in range(1, len(audio)):
+        filtered[i] = audio[i] - audio[i-1] + alpha * filtered[i-1]
+    audio = filtered
+    
+    # 3. Улучшенная нормализация громкости (peak + RMS hybrid)
+    max_val = np.max(np.abs(audio))
+    rms = np.sqrt(np.mean(audio**2))
+    
+    if max_val > 0.01:
+        # Нормализуем по пику, но учитываем RMS для контроля динамики
+        target_rms = 0.15  # Целевой RMS уровень
+        if rms > 0.001:
+            # Ограничиваем усиление чтобы не поднять шум
+            gain = min(target_rms / rms, 0.95 / max_val, 3.0)
+            audio = audio * gain
+        else:
+            audio = audio / max_val * 0.95
+    
+    # 4. Мягкое ограничение пиков (soft clipping) для предотвращения клиппинга
+    audio = np.tanh(audio * 1.2) / np.tanh(1.2)  # Soft saturation
+    
+    # Контекст - оптимизированный prompt для Kiko
+    context_prompt = "Kiko"  # Базовый prompt для boosting wake word
+    if len(session.conversation_context) >= 2:
         recent = session.conversation_context[-2:]
         clean_context = ' '.join(recent).replace('assistant', '').replace('Assistant', '')
-        if clean_context.strip() and len(clean_context) < 200:
-            context_prompt = clean_context.strip()
+        if clean_context.strip() and len(clean_context) < 150:
+            context_prompt = f"Kiko. {clean_context.strip()}"
     
     start_time = time.perf_counter()
     
-    # Синхронная функция для выполнения в executor - ВЫСОКОЕ КАЧЕСТВО
+    # Синхронная функция для выполнения в executor - МАКСИМАЛЬНОЕ КАЧЕСТВО
     # ВАЖНО: используем lock для сериализации доступа к GPU модели
     def _transcribe_sync():
-        # Защита от слишком короткого аудио (< 0.8 сек) - предотвращает sequence error
-        if len(audio) < SAMPLE_RATE * 0.8:
+        # Защита от слишком короткого аудио (< 0.6 сек) - оптимизировано
+        if len(audio) < SAMPLE_RATE * 0.6:
             return {"text": "", "segments": []}
         
         # Lock для предотвращения конкурентного доступа к модели
