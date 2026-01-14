@@ -340,35 +340,26 @@ def determine_pause_duration(text: str, speech_duration_ms: float) -> int:
     if word_count <= 2:
         return VADConfig.MIN_PAUSE_MS
     
-    # 2. Команды с wake word - быстрая реакция
-    has_optimus = any(w in text_lower for w in ['optimus', 'оптимус'])
-    if has_optimus and word_count <= 5:
-        return VADConfig.MIN_PAUSE_MS
-    
-    # 3. Явно завершённые предложения (точка, !, ?)
+    # 2. Явно завершённые предложения (точка, !, ?)
     if re.search(r'[.!?]$', text_lower):
         return VADConfig.MIN_PAUSE_MS + 50  # Немного больше для уверенности
     
-    # 4. Короткие ответы - быстро
+    # 3. Короткие ответы - быстро
     for pattern in SHORT_RESPONSE_PATTERNS:
         if re.match(pattern, text_lower, re.IGNORECASE):
             return VADConfig.MIN_PAUSE_MS
     
-    # 5. Команды - быстро
+    # 4. Команды - быстро
     for pattern in COMMAND_PATTERNS:
         if re.search(pattern, text_lower, re.IGNORECASE):
             return VADConfig.MIN_PAUSE_MS + 50
     
-    # 6. Вопросы без знака вопроса в конце
+    # 5. Вопросы - нужна пауза побольше чтобы человек договорил
     for pattern in QUESTION_PATTERNS:
         if re.search(pattern, text_lower, re.IGNORECASE):
-            return VADConfig.QUESTION_PAUSE_MS
+            return VADConfig.DEFAULT_PAUSE_MS  # 1000ms для вопросов
     
-    # 7. Незавершённые предложения - ждём дольше
-    # Признаки незавершённости:
-    #   - заканчивается на союз/предлог
-    #   - заканчивается на запятую
-    #   - последнее слово < 3 букв и не существительное
+    # 6. Незавершённые предложения - ждём дольше
     incomplete_endings = ['и', 'а', 'но', 'или', 'что', 'как', 'где', 'когда', 
                          'and', 'or', 'but', 'that', 'which', 'who', 'where',
                          'the', 'a', 'an', 'to', 'for', 'with', 'in', 'on']
