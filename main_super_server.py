@@ -1,11 +1,13 @@
 """
-WebSocket STT сервер v2.6 - Wake word "Optimus"
-OpenAI Whisper Medium на GPU + Picovoice Porcupine Wake Word
+WebSocket STT сервер v2.8 - Оптимизирован как Alexa/Google Assistant
+OpenAI Whisper Medium на GPU
 
-Улучшения v2.6:
-- Замена wake word "Kiko" на "Optimus" во всём коде
-- Обновлены CORRECTION_DICT, PHONETIC_VARIANTS, HOTWORDS
-- Обновлены функции fuzzy_match, check_first_word, clean_duplicate
+Улучшения v2.8:
+- Сессии НЕ удаляются при молчании - пользователь может думать
+- Мягкая очистка GPU без блокировки
+- Увеличен порог тишины до 10 сек для комфортной работы
+- Zombie-сессии удаляются только через 5 минут полной неактивности
+- Меньше спама в логах
 """
 import warnings
 warnings.filterwarnings("ignore")
@@ -245,64 +247,77 @@ sessions: Dict[str, ClientSession] = {}
 sessions_lock = asyncio.Lock()  # asyncio Lock вместо threading Lock для async контекста
 
 # Максимальное количество одновременных сессий (защита от перегрузки)
-MAX_CONCURRENT_SESSIONS = 20  # Уменьшено с 50 - реалистичнее для GPU
+MAX_CONCURRENT_SESSIONS = 30  # Баланс между нагрузкой и доступностью
 
-# Таймаут неактивной сессии (секунды) - сессии без активности удаляются
-SESSION_IDLE_TIMEOUT = 60.0  # Уменьшено с 120 - быстрее освобождаем ресурсы
+# Таймаут неактивной сессии (секунды) - ТОЛЬКО для зомби-сессий (WS отключился но сессия осталась)
+# НЕ влияет на живые соединения - пользователь может молчать сколько угодно
+SESSION_ZOMBIE_TIMEOUT = 300.0  # 5 минут - только для cleanup зависших сессий
+
+# Интервал очистки GPU памяти (секунды) - НЕ блокирующая очистка
+GPU_CLEANUP_INTERVAL = 60.0  # Реже очищаем чтобы не мешать работе
 
 # Максимальный размер очереди транскрипций (защита от лавины)
-MAX_TRANSCRIPTION_QUEUE = 5
+MAX_TRANSCRIPTION_QUEUE = 8  # Увеличено для плавности
 
 
 async def cleanup_stale_sessions():
-    """Удаляет зависшие сессии которые не отправляли данные долгое время"""
+    """
+    Удаляет ТОЛЬКО зомби-сессии (WebSocket отключился, но сессия осталась в памяти).
+    НЕ удаляет сессии живых клиентов, даже если они молчат - как у Alexa/Google Assistant.
+    """
     current_time = time.time()
     stale_ids = []
     
     async with sessions_lock:
         for client_id, session in sessions.items():
-            # Используем last_activity для отслеживания активности
+            # Проверяем ТОЛЬКО очень старые сессии (зомби)
+            # Живые клиенты обновляют last_activity при каждом аудио-сообщении
             idle_time = current_time - session.last_activity
             
-            if idle_time > SESSION_IDLE_TIMEOUT:
+            # Удаляем только если сессия неактивна ОЧЕНЬ долго (скорее всего зомби)
+            if idle_time > SESSION_ZOMBIE_TIMEOUT:
                 stale_ids.append(client_id)
         
-        # Удаляем зависшие сессии
+        # Удаляем зомби-сессии
         for client_id in stale_ids:
-            print(f"🗑️ [{client_id}] Removing stale session (idle > {SESSION_IDLE_TIMEOUT}s)")
+            print(f"🗑️ [{client_id}] Removing zombie session (no activity for {SESSION_ZOMBIE_TIMEOUT}s)")
             del sessions[client_id]
     
     if stale_ids:
-        print(f"🧹 Cleaned up {len(stale_ids)} stale sessions")
+        print(f"🧹 Cleaned up {len(stale_ids)} zombie sessions")
 
 
 async def cleanup_gpu_memory(force: bool = False):
-    """Периодическая очистка GPU памяти для предотвращения утечек"""
+    """
+    Мягкая очистка GPU памяти - НЕ блокирует и НЕ мешает работе.
+    Как у топовых голосовых помощников - очистка в фоне, незаметно для пользователя.
+    """
     global last_gpu_cleanup
     current_time = time.time()
     
-    # Принудительная очистка или по таймеру
+    # Очистка по таймеру или принудительная
     if force or current_time - last_gpu_cleanup > GPU_CLEANUP_INTERVAL:
         try:
-            # Сначала очищаем зависшие сессии
+            # Сначала очищаем только зомби-сессии (не живых клиентов!)
             await cleanup_stale_sessions()
             
             if torch.cuda.is_available():
-                # Агрессивная очистка GPU памяти
+                # Мягкая очистка - только empty_cache, БЕЗ synchronize чтобы не блокировать
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()  # Ждём завершения всех операций
-                gc.collect()
-                
-                # Логируем состояние памяти GPU
-                mem_allocated = torch.cuda.memory_allocated() / 1024**2
-                mem_reserved = torch.cuda.memory_reserved() / 1024**2
-                print(f"🧹 GPU memory: {mem_allocated:.0f}MB allocated, {mem_reserved:.0f}MB reserved")
+                # gc.collect() вызываем только при принудительной очистке
+                if force:
+                    gc.collect()
                 
             last_gpu_cleanup = current_time
-            async with sessions_lock:
-                active_count = len(sessions)
-            print(f"🧹 GPU memory cleanup performed")
-            print(f"📊 Активных сессий: {active_count}")
+            
+            # Логируем только при принудительной очистке или раз в 5 минут
+            if force or current_time % 300 < GPU_CLEANUP_INTERVAL:
+                async with sessions_lock:
+                    active_count = len(sessions)
+                if torch.cuda.is_available():
+                    mem_allocated = torch.cuda.memory_allocated() / 1024**2
+                    mem_reserved = torch.cuda.memory_reserved() / 1024**2
+                    print(f"🧹 GPU: {mem_allocated:.0f}MB/{mem_reserved:.0f}MB | Sessions: {active_count}")
         except Exception as e:
             print(f"⚠️ GPU cleanup error: {e}")
 
@@ -1090,9 +1105,10 @@ async def handle_client(websocket):
     frame_samples = int(SAMPLE_RATE * VADConfig.FRAME_MS / 1000)
     pcm_buffer = np.array([], dtype=np.float32)
     
-    # Счётчик тишины для предотвращения галлюцинаций при перезагрузке
+    # Счётчик тишины - высокий порог чтобы не мешать пользователю думать
+    # 500 фреймов * 20мс = 10 секунд тишины до мягкого сброса буферов
     silence_streak = 0
-    MAX_SILENCE_BEFORE_SKIP = 150  # N сек тишины подряд = скипаем обработку
+    MAX_SILENCE_BEFORE_SOFT_RESET = 500  # ~10 секунд молчания
     
     # Счётчик для периодической очистки
     message_counter = 0
@@ -1100,15 +1116,16 @@ async def handle_client(websocket):
     try:
         await websocket.send(json.dumps({
             "type": "connected",
-            "message": "ChatGPT-style STT server ready (v2.1 anti-hallucination)",
+            "message": "STT server ready (v2.8 - optimized like Alexa/Google)",
             "sample_rate": SAMPLE_RATE,
-            "model": "whisper-small",
+            "model": "whisper-medium",
             "device": device,
             "features": [
                 "adaptive_pause_detection",
                 "streaming_partials",
                 "speaker_identification",
                 "hallucination_filter",
+                "graceful_silence_handling",
             ],
         }))
         
@@ -1125,10 +1142,11 @@ async def handle_client(websocket):
                     # Обновляем время последней активности сессии
                     session.last_activity = time.time()
                     
-                    # Периодическая очистка GPU памяти (каждые 500 сообщений на сессию)
+                    # Мягкая очистка GPU - реже и без force (каждые 2000 сообщений)
+                    # Не мешает работе пользователя
                     message_counter += 1
-                    if message_counter % 500 == 0:
-                        await cleanup_gpu_memory(force=True)
+                    if message_counter % 2000 == 0:
+                        await cleanup_gpu_memory(force=False)
                     
                     try:
                         audio_chunk = np.frombuffer(
@@ -1146,16 +1164,18 @@ async def handle_client(websocket):
                     else:
                         silence_streak = 0
                     
-                    # Если слишком долго тишина - сбрасываем буферы для предотвращения галлюцинаций
-                    if silence_streak > MAX_SILENCE_BEFORE_SKIP:
-                        if session.state != SpeechState.SILENCE:
-                            print(f"🔇 [{client_id}] Long silence detected, resetting buffers")
+                    # Длительная тишина - мягко сбрасываем только если есть накопленные данные
+                    # НЕ прерываем соединение - пользователь может думать (как у Alexa)
+                    if silence_streak > MAX_SILENCE_BEFORE_SOFT_RESET:
+                        # Сбрасываем только speech буфер если он большой и явно мусорный
+                        if session.state != SpeechState.SILENCE and len(session.speech_buffer) > 100:
+                            # Тихо сбрасываем без спама в логи
                             session.speech_buffer = []
                             session.state = SpeechState.SILENCE
                             session.speech_frames = 0
                             session.silence_frames = 0
-                        pcm_buffer = np.array([], dtype=np.float32)
-                        continue
+                        # НЕ сбрасываем pcm_buffer - продолжаем слушать
+                        # НЕ делаем continue - обрабатываем чанк нормально
                     
                     pcm_buffer = np.concatenate([pcm_buffer, audio_chunk])
                     
