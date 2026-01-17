@@ -67,11 +67,15 @@ whisper_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper
 whisper_lock = threading.Lock()
 
 # Таймаут для транскрибации (секунды)
-TRANSCRIBE_TIMEOUT = 30.0
+TRANSCRIBE_TIMEOUT = 15.0  # Уменьшено с 30 - если не успели, лучше пропустить
 
 # Интервал очистки GPU памяти (секунды)
-GPU_CLEANUP_INTERVAL = 60.0
+GPU_CLEANUP_INTERVAL = 30.0  # Чаще очищаем (было 60)
 last_gpu_cleanup = time.time()
+
+# Счётчик транскрипций для отслеживания нагрузки
+transcription_queue_size = 0
+transcription_queue_lock = threading.Lock()
 
 # ===============================
 # НАСТРОЙКИ - ОПТИМИЗИРОВАННЫЕ КАК У OPENAI AUDIO
@@ -79,14 +83,14 @@ last_gpu_cleanup = time.time()
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2  # int16
 
-# === WHISPER ADVANCED SETTINGS - МАКСИМАЛЬНОЕ КАЧЕСТВО v2.2 ===
+# === WHISPER ADVANCED SETTINGS - ОПТИМИЗИРОВАНО для СКОРОСТИ v2.7 ===
 class WhisperConfig:
-    # Beam search - УВЕЛИЧЕНО для лучшего качества
-    BEAM_SIZE = 7      # 7 beams - выше качество для коротких фраз
-    BEST_OF = 7        # Выбор лучшего из 7 кандидатов
+    # Beam search - УМЕНЬШЕНО для скорости (было 7/7)
+    BEAM_SIZE = 3      # 3 beams - баланс скорости и качества
+    BEST_OF = 3        # Выбор лучшего из 3 кандидатов
     
-    # Temperature - НИЗКАЯ для стабильности, агрессивный fallback
-    TEMPERATURE = (0.0, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0)  # Больше шагов для fallback
+    # Temperature - НИЗКАЯ для стабильности, меньше fallback шагов
+    TEMPERATURE = (0.0, 0.2, 0.4, 0.6)  # Меньше шагов = быстрее
     
     # Compression ratio - МЯГЧЕ для сохранения коротких фраз
     COMPRESSION_RATIO_THRESHOLD = 2.8
@@ -100,8 +104,8 @@ class WhisperConfig:
     # Condition on previous - отключено для независимости
     CONDITION_ON_PREVIOUS = False
     
-    # Word timestamps - ВКЛЮЧЕНО для точности и word-level confidence
-    WORD_TIMESTAMPS = True  # Улучшает точность + даёт уверенность по словам
+    # Word timestamps - ОТКЛЮЧЕНО для скорости (было True)
+    WORD_TIMESTAMPS = False  # Отключаем - экономит ~20% времени
     
     # Punctuations - расширенный набор
     PREPEND_PUNCTUATIONS = "\"'¿([{-«"
@@ -241,10 +245,13 @@ sessions: Dict[str, ClientSession] = {}
 sessions_lock = asyncio.Lock()  # asyncio Lock вместо threading Lock для async контекста
 
 # Максимальное количество одновременных сессий (защита от перегрузки)
-MAX_CONCURRENT_SESSIONS = 50
+MAX_CONCURRENT_SESSIONS = 20  # Уменьшено с 50 - реалистичнее для GPU
 
 # Таймаут неактивной сессии (секунды) - сессии без активности удаляются
-SESSION_IDLE_TIMEOUT = 120.0  # 2 минуты
+SESSION_IDLE_TIMEOUT = 60.0  # Уменьшено с 120 - быстрее освобождаем ресурсы
+
+# Максимальный размер очереди транскрипций (защита от лавины)
+MAX_TRANSCRIPTION_QUEUE = 5
 
 
 async def cleanup_stale_sessions():
@@ -281,8 +288,16 @@ async def cleanup_gpu_memory(force: bool = False):
             await cleanup_stale_sessions()
             
             if torch.cuda.is_available():
+                # Агрессивная очистка GPU памяти
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Ждём завершения всех операций
                 gc.collect()
+                
+                # Логируем состояние памяти GPU
+                mem_allocated = torch.cuda.memory_allocated() / 1024**2
+                mem_reserved = torch.cuda.memory_reserved() / 1024**2
+                print(f"🧹 GPU memory: {mem_allocated:.0f}MB allocated, {mem_reserved:.0f}MB reserved")
+                
             last_gpu_cleanup = current_time
             async with sessions_lock:
                 active_count = len(sessions)
@@ -667,166 +682,184 @@ async def transcribe_audio(audio: np.ndarray, session: ClientSession, is_partial
     Использует OpenAI-style параметры для лучшего качества.
     is_partial=True подавляет verbose логирование.
     """
+    global transcription_queue_size
+    
     audio_duration = len(audio) / SAMPLE_RATE
     
-    # ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ: проверяем энергию аудио перед транскрибацией
-    if not has_sufficient_audio_energy(audio):
-        if not is_partial:  # Не спамим для partial
-            print(f"⚠️ [{session.client_id}] Audio energy too low, skipping transcription")
-        return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3), 
-                   "realtime_factor": 0, "samples": len(audio), "skipped": "low_energy"}
-    
-    # === УЛУЧШЕННАЯ ПРЕДОБРАБОТКА АУДИО v2.3 ===
-    
-    # ВАЖНО: Whisper требует float32, убеждаемся в правильном типе
-    audio = audio.astype(np.float32)
-    
-    # 1. Убираем DC offset (постоянную составляющую)
-    audio = audio - np.mean(audio, dtype=np.float32)
-    
-    # 2. Мягкий high-pass фильтр для удаления низкочастотного гула (< 80 Hz)
-    # Простой single-pole filter: y[n] = x[n] - x[n-1] + 0.97 * y[n-1]
-    alpha = np.float32(0.97)
-    filtered = np.zeros_like(audio, dtype=np.float32)
-    for i in range(1, len(audio)):
-        filtered[i] = audio[i] - audio[i-1] + alpha * filtered[i-1]
-    audio = filtered
-    
-    # 3. Улучшенная нормализация громкости (peak + RMS hybrid)
-    max_val = np.max(np.abs(audio))
-    rms = np.sqrt(np.mean(audio**2))
-    
-    if max_val > 0.01:
-        # Нормализуем по пику, но учитываем RMS для контроля динамики
-        target_rms = np.float32(0.15)  # Целевой RMS уровень
-        if rms > 0.001:
-            # Ограничиваем усиление чтобы не поднять шум
-            gain = np.float32(min(target_rms / rms, 0.95 / max_val, 3.0))
-            audio = audio * gain
-        else:
-            audio = audio / max_val * np.float32(0.95)
-    
-    # 4. Мягкое ограничение пиков (soft clipping) для предотвращения клиппинга
-    audio = np.tanh(audio * np.float32(1.2)) / np.float32(np.tanh(1.2))
-    
-    # Финальная проверка типа - ОБЯЗАТЕЛЬНО float32 для Whisper!
-    audio = audio.astype(np.float32)
-    
-    # ПРОМПТ ОТКЛЮЧЁН - вызывал галлюцинации и ухудшал распознавание
-    # context_prompt = None
-    
-    start_time = time.perf_counter()
-    
-    # Синхронная функция для выполнения в executor - МАКСИМАЛЬНОЕ КАЧЕСТВО
-    # ВАЖНО: используем lock для сериализации доступа к GPU модели
-    def _transcribe_sync():
-        # Защита от слишком короткого аудио (< 0.6 сек) - оптимизировано
-        if len(audio) < SAMPLE_RATE * 0.6:
-            return {"text": "", "segments": []}
-        
-        # Lock для предотвращения конкурентного доступа к модели
-        # Это решает ошибки "Key and Value must have the same sequence length"
-        with whisper_lock:
-            try:
-                return whisper_model.transcribe(
-                    audio,
-                    language="en",  # Фиксированный язык для стабильности
-                    task="transcribe",
-                    # initial_prompt ОТКЛЮЧЁН
-                    fp16=True,
-                    
-                    # Beam search для качества
-                    beam_size=WhisperConfig.BEAM_SIZE,
-                    best_of=WhisperConfig.BEST_OF,
-                    
-                    # Temperature - низкая для стабильности
-                    temperature=WhisperConfig.TEMPERATURE,
-                    
-                    # Фильтры качества
-                    compression_ratio_threshold=WhisperConfig.COMPRESSION_RATIO_THRESHOLD,
-                    logprob_threshold=WhisperConfig.LOGPROB_THRESHOLD,
-                    no_speech_threshold=WhisperConfig.NO_SPEECH_THRESHOLD,
-                    
-                    # Независимые сегменты
-                    condition_on_previous_text=WhisperConfig.CONDITION_ON_PREVIOUS,
-                    
-                    # Word timestamps для точности
-                    word_timestamps=WhisperConfig.WORD_TIMESTAMPS,
-                    
-                    # Пунктуация
-                    prepend_punctuations=WhisperConfig.PREPEND_PUNCTUATIONS,
-                    append_punctuations=WhisperConfig.APPEND_PUNCTUATIONS,
-                )
-            except RuntimeError as e:
-                # Ловим CUDA/PyTorch ошибки и возвращаем пустой результат
-                error_msg = str(e)
-                if "sequence length" in error_msg or "size" in error_msg or "shape" in error_msg:
-                    print(f"⚠️ [{session.client_id}] CUDA tensor error (recovering): {error_msg[:80]}")
-                    # Очищаем GPU кэш при ошибке
-                    torch.cuda.empty_cache()
-                    return {"text": "", "segments": []}
-                raise  # Пробрасываем другие ошибки
+    # ЗАЩИТА ОТ ПЕРЕГРУЗКИ: если очередь слишком большая, пропускаем partial
+    with transcription_queue_lock:
+        if transcription_queue_size >= MAX_TRANSCRIPTION_QUEUE:
+            if is_partial:
+                return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3),
+                           "skipped": "queue_full"}
+            # Для финальных - ждём, но логируем
+            print(f"⚠️ [{session.client_id}] Transcription queue full ({transcription_queue_size}), waiting...")
+        transcription_queue_size += 1
     
     try:
-        # Выполняем блокирующую транскрибацию в отдельном потоке с таймаутом
-        loop = asyncio.get_event_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(whisper_executor, _transcribe_sync),
-            timeout=TRANSCRIBE_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        print(f"⚠️ [{session.client_id}] Transcription timeout after {TRANSCRIBE_TIMEOUT}s")
-        return "", {"transcription_time_ms": TRANSCRIBE_TIMEOUT * 1000, 
-                   "audio_duration_s": round(audio_duration, 3),
-                   "error": "timeout"}
-    except Exception as e:
-        print(f"❌ [{session.client_id}] Transcription error: {e}")
-        return "", {"transcription_time_ms": 0, 
-                   "audio_duration_s": round(audio_duration, 3),
-                   "error": str(e)}
+        # ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ: проверяем энергию аудио перед транскрибацией
+        if not has_sufficient_audio_energy(audio):
+            if not is_partial:  # Не спамим для partial
+                print(f"⚠️ [{session.client_id}] Audio energy too low, skipping transcription")
+            return "", {"transcription_time_ms": 0, "audio_duration_s": round(audio_duration, 3), 
+                       "realtime_factor": 0, "samples": len(audio), "skipped": "low_energy"}
+        
+        # === УЛУЧШЕННАЯ ПРЕДОБРАБОТКА АУДИО v2.3 ===
+        
+        # ВАЖНО: Whisper требует float32, убеждаемся в правильном типе
+        audio = audio.astype(np.float32)
+        
+        # 1. Убираем DC offset (постоянную составляющую)
+        audio = audio - np.mean(audio, dtype=np.float32)
+        
+        # 2. Мягкий high-pass фильтр для удаления низкочастотного гула (< 80 Hz)
+        # Простой single-pole filter: y[n] = x[n] - x[n-1] + 0.97 * y[n-1]
+        alpha = np.float32(0.97)
+        filtered = np.zeros_like(audio, dtype=np.float32)
+        for i in range(1, len(audio)):
+            filtered[i] = audio[i] - audio[i-1] + alpha * filtered[i-1]
+        audio = filtered
+        
+        # 3. Улучшенная нормализация громкости (peak + RMS hybrid)
+        max_val = np.max(np.abs(audio))
+        rms = np.sqrt(np.mean(audio**2))
+        
+        if max_val > 0.01:
+            # Нормализуем по пику, но учитываем RMS для контроля динамики
+            target_rms = np.float32(0.15)  # Целевой RMS уровень
+            if rms > 0.001:
+                # Ограничиваем усиление чтобы не поднять шум
+                gain = np.float32(min(target_rms / rms, 0.95 / max_val, 3.0))
+                audio = audio * gain
+            else:
+                audio = audio / max_val * np.float32(0.95)
+        
+        # 4. Мягкое ограничение пиков (soft clipping) для предотвращения клиппинга
+        audio = np.tanh(audio * np.float32(1.2)) / np.float32(np.tanh(1.2))
+        
+        # Финальная проверка типа - ОБЯЗАТЕЛЬНО float32 для Whisper!
+        audio = audio.astype(np.float32)
+        
+        # ПРОМПТ ОТКЛЮЧЁН - вызывал галлюцинации и ухудшал распознавание
+        # context_prompt = None
+        
+        start_time = time.perf_counter()
+        
+        # Синхронная функция для выполнения в executor - МАКСИМАЛЬНОЕ КАЧЕСТВО
+        # ВАЖНО: используем lock для сериализации доступа к GPU модели
+        def _transcribe_sync():
+            # Защита от слишком короткого аудио (< 0.6 сек) - оптимизировано
+            if len(audio) < SAMPLE_RATE * 0.6:
+                return {"text": "", "segments": []}
+            
+            # Lock для предотвращения конкурентного доступа к модели
+            # Это решает ошибки "Key and Value must have the same sequence length"
+            with whisper_lock:
+                try:
+                    return whisper_model.transcribe(
+                        audio,
+                        language="en",  # Фиксированный язык для стабильности
+                        task="transcribe",
+                        # initial_prompt ОТКЛЮЧЁН
+                        fp16=True,
+                        
+                        # Beam search для качества
+                        beam_size=WhisperConfig.BEAM_SIZE,
+                        best_of=WhisperConfig.BEST_OF,
+                        
+                        # Temperature - низкая для стабильности
+                        temperature=WhisperConfig.TEMPERATURE,
+                        
+                        # Фильтры качества
+                        compression_ratio_threshold=WhisperConfig.COMPRESSION_RATIO_THRESHOLD,
+                        logprob_threshold=WhisperConfig.LOGPROB_THRESHOLD,
+                        no_speech_threshold=WhisperConfig.NO_SPEECH_THRESHOLD,
+                        
+                        # Независимые сегменты
+                        condition_on_previous_text=WhisperConfig.CONDITION_ON_PREVIOUS,
+                        
+                        # Word timestamps для точности
+                        word_timestamps=WhisperConfig.WORD_TIMESTAMPS,
+                        
+                        # Пунктуация
+                        prepend_punctuations=WhisperConfig.PREPEND_PUNCTUATIONS,
+                        append_punctuations=WhisperConfig.APPEND_PUNCTUATIONS,
+                    )
+                except RuntimeError as e:
+                    # Ловим CUDA/PyTorch ошибки и возвращаем пустой результат
+                    error_msg = str(e)
+                    if "sequence length" in error_msg or "size" in error_msg or "shape" in error_msg:
+                        print(f"⚠️ [{session.client_id}] CUDA tensor error (recovering): {error_msg[:80]}")
+                        # Очищаем GPU кэш при ошибке
+                        torch.cuda.empty_cache()
+                        return {"text": "", "segments": []}
+                    raise  # Пробрасываем другие ошибки
+        
+        try:
+            # Выполняем блокирующую транскрибацию в отдельном потоке с таймаутом
+            loop = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(whisper_executor, _transcribe_sync),
+                timeout=TRANSCRIBE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            print(f"⚠️ [{session.client_id}] Transcription timeout after {TRANSCRIBE_TIMEOUT}s")
+            return "", {"transcription_time_ms": TRANSCRIBE_TIMEOUT * 1000, 
+                       "audio_duration_s": round(audio_duration, 3),
+                       "error": "timeout"}
+        except Exception as e:
+            print(f"❌ [{session.client_id}] Transcription error: {e}")
+            return "", {"transcription_time_ms": 0, 
+                       "audio_duration_s": round(audio_duration, 3),
+                       "error": str(e)}
+        
+        # Защита от None результата (может случиться при CUDA ошибках)
+        if result is None:
+            print(f"⚠️ [{session.client_id}] Transcription returned None")
+            return "", {"transcription_time_ms": 0, 
+                       "audio_duration_s": round(audio_duration, 3),
+                       "error": "null_result"}
+        
+        text = result.get("text", "").strip() if isinstance(result, dict) else ""
+        text = apply_post_correction(text)
+        
+        # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если первое слово похоже на Optimus - исправляем
+        original_first_word = text
+        text = check_first_word_is_optimus(text)
+        if text != original_first_word and not is_partial:
+            print(f"🔧 [{session.client_id}] Fixed first word to Optimus: {original_first_word!r} -> {text!r}")
+        
+        # Очищаем дублирующиеся "optimus" (оставляем только первый)
+        original_text = text
+        text = clean_duplicate_optimus(text)
+        if text != original_text and not is_partial:
+            print(f"🔧 [{session.client_id}] Cleaned duplicate optimus: {original_text!r} -> {text!r}")
+        
+        end_time = time.perf_counter()
+        transcription_time = (end_time - start_time) * 1000
+        rtf = audio_duration / (transcription_time / 1000) if transcription_time > 0 else 0
+        
+        # ПРОВЕРКА НА ГАЛЛЮЦИНАЦИИ
+        if is_hallucination(text):
+            print(f"🚫 [{session.client_id}] Hallucination filtered: {text!r}")
+            return "", {"transcription_time_ms": round(transcription_time, 2), 
+                       "audio_duration_s": round(audio_duration, 3),
+                       "realtime_factor": round(rtf, 2), "samples": len(audio), 
+                       "filtered": "hallucination", "original_text": text}
+        
+        metrics = {
+            "transcription_time_ms": round(transcription_time, 2),
+            "audio_duration_s": round(audio_duration, 3),
+            "realtime_factor": round(rtf, 2),
+            "samples": len(audio),
+        }
+        
+        return text, metrics
     
-    # Защита от None результата (может случиться при CUDA ошибках)
-    if result is None:
-        print(f"⚠️ [{session.client_id}] Transcription returned None")
-        return "", {"transcription_time_ms": 0, 
-                   "audio_duration_s": round(audio_duration, 3),
-                   "error": "null_result"}
-    
-    text = result.get("text", "").strip() if isinstance(result, dict) else ""
-    text = apply_post_correction(text)
-    
-    # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: если первое слово похоже на Optimus - исправляем
-    original_first_word = text
-    text = check_first_word_is_optimus(text)
-    if text != original_first_word and not is_partial:
-        print(f"🔧 [{session.client_id}] Fixed first word to Optimus: {original_first_word!r} -> {text!r}")
-    
-    # Очищаем дублирующиеся "optimus" (оставляем только первый)
-    original_text = text
-    text = clean_duplicate_optimus(text)
-    if text != original_text and not is_partial:
-        print(f"🔧 [{session.client_id}] Cleaned duplicate optimus: {original_text!r} -> {text!r}")
-    
-    end_time = time.perf_counter()
-    transcription_time = (end_time - start_time) * 1000
-    rtf = audio_duration / (transcription_time / 1000) if transcription_time > 0 else 0
-    
-    # ПРОВЕРКА НА ГАЛЛЮЦИНАЦИИ
-    if is_hallucination(text):
-        print(f"🚫 [{session.client_id}] Hallucination filtered: {text!r}")
-        return "", {"transcription_time_ms": round(transcription_time, 2), 
-                   "audio_duration_s": round(audio_duration, 3),
-                   "realtime_factor": round(rtf, 2), "samples": len(audio), 
-                   "filtered": "hallucination", "original_text": text}
-    
-    metrics = {
-        "transcription_time_ms": round(transcription_time, 2),
-        "audio_duration_s": round(audio_duration, 3),
-        "realtime_factor": round(rtf, 2),
-        "samples": len(audio),
-    }
-    
-    return text, metrics
+    finally:
+        # Всегда уменьшаем счётчик очереди
+        with transcription_queue_lock:
+            transcription_queue_size = max(0, transcription_queue_size - 1)
 
 
 async def process_vad_frame(session: ClientSession, frame: np.ndarray, websocket) -> Optional[dict]:
